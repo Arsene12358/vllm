@@ -518,6 +518,54 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
 
 @dataclass(frozen=True)
+class SinkWindowSpec(AttentionSpec):
+    """StreamingLLM-style attention: pin the first `start_size` tokens and the
+    last `sliding_window` tokens; the middle is evictable.
+
+    Used by `SinkWindowManager` (see single_type_kv_cache_manager.py). All
+    layers in a SinkWindow KV cache group must share the same start_size
+    and sliding_window — enforced by the base `KVCacheSpec.merge` via
+    frozen-dataclass equality.
+
+    Phase 1 scope: KV management only. The FA3 attention kernel sees a
+    contiguous block table because the metadata builder (Phase 2a) splices
+    the null run between sinks and recent window out before the FA call.
+    """
+
+    sliding_window: int  # recent_size, the tail window length
+    start_size: int  # number of pinned sink tokens at the prefix
+
+    def __post_init__(self) -> None:
+        if self.start_size <= 0:
+            raise ValueError(
+                f"SinkWindowSpec.start_size must be > 0, got {self.start_size}"
+            )
+        if self.sliding_window <= 0:
+            raise ValueError(
+                "SinkWindowSpec.sliding_window must be > 0, "
+                f"got {self.sliding_window}"
+            )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
+            "DCP not supported for sink+window attention."
+        )
+        max_model_len = vllm_config.model_config.max_model_len
+        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+
+        # Per-request live KV: pinned start_size tokens + (sliding_window - 1)
+        # most-recent tokens + the batch's new tokens. Capped at max_model_len.
+        num_tokens = min(
+            self.start_size + self.sliding_window - 1 + max_num_batched_tokens,
+            max_model_len,
+        )
+
+        # +1 because the recent window may not be block-aligned (same reason
+        # as SlidingWindowSpec).
+        return (cdiv(num_tokens, self.block_size) + 1) * self.page_size_bytes
+
+
+@dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
     dtypes: tuple[torch.dtype]
@@ -673,6 +721,13 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             return all(
                 isinstance(spec, SlidingWindowSpec)
                 and spec.sliding_window == one_spec.sliding_window
+                for spec in kv_cache_specs.values()
+            )
+        elif isinstance(one_spec, SinkWindowSpec):
+            return all(
+                isinstance(spec, SinkWindowSpec)
+                and spec.sliding_window == one_spec.sliding_window
+                and spec.start_size == one_spec.start_size
                 for spec in kv_cache_specs.values()
             )
         elif isinstance(one_spec, ChunkedLocalAttentionSpec):
