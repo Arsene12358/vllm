@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SinkFullAttentionSpec,
+    SinkWindowSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
@@ -637,6 +638,71 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return 0
 
 
+class SinkWindowManager(SlidingWindowManager):
+    """KV cache manager for SinkWindowSpec (StreamingLLM-style attention).
+
+    Pins the first `start_size` tokens (rounded up to a whole number of blocks)
+    so eviction only targets the middle — between the pinned sink prefix and
+    the rolling recent-window tail. The per-request block layout post-eviction
+    is `[sink_blocks ..., NULL ..., recent_blocks ...]`. The cascade-attention
+    metadata builder (Phase 2a) splices the null run out before the FA call.
+
+    Phase 1 deliberately disables prefix caching for SinkWindowSpec groups —
+    the discontiguous layout breaks the contiguous-prefix matcher in
+    `SlidingWindowManager.find_longest_cache_hit`. Re-prefilling sink + window
+    on cache miss is acceptable correctness behavior; tightening this is a
+    follow-up.
+    """
+
+    def __init__(
+        self, kv_cache_spec: SinkWindowSpec, block_pool: BlockPool, **kwargs
+    ) -> None:
+        super().__init__(kv_cache_spec, block_pool, **kwargs)
+        self.start_size = kv_cache_spec.start_size
+        # cdiv so a partial last sink block still counts as pinned.
+        self.start_block_count = cdiv(self.start_size, self.block_size)
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: list[BlockHash],
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        dcp_world_size: int = 1,
+    ) -> tuple[list[KVCacheBlock], ...]:
+        # See class docstring: disable prefix caching for Phase 1.
+        assert isinstance(kv_cache_spec, SinkWindowSpec), (
+            "SinkWindowManager can only be used for sink+window groups"
+        )
+        return tuple([] for _ in kv_cache_group_ids)
+
+    def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
+        # Same as SlidingWindowManager but stops the eviction loop at
+        # `start_block_count` so the pinned sink prefix is never freed.
+        last_useful_token = num_computed_tokens - self.sliding_window + 1
+        last_useful_block = last_useful_token // self.block_size
+        if last_useful_block <= self.start_block_count:
+            # Either the window hasn't grown past the sink budget yet,
+            # or there's nothing between sinks and the recent window.
+            return
+        blocks = self.req_to_blocks[request_id]
+        if blocks[last_useful_block - 1] == self._null_block:
+            return
+        removed_blocks: list[KVCacheBlock] = []
+        # range(start, stop, -1) walks start, start-1, ..., stop+1 — so with
+        # stop = start_block_count - 1 we touch indices [start_block_count ..
+        # last_useful_block - 1] and never the pinned [0 .. start_block_count).
+        for i in range(last_useful_block - 1, self.start_block_count - 1, -1):
+            if blocks[i] == self._null_block:
+                break
+            removed_blocks.append(blocks[i])
+            blocks[i] = self._null_block
+        self.block_pool.free_blocks(removed_blocks)
+
+
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
     def __init__(self, kv_cache_spec: ChunkedLocalAttentionSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
@@ -1139,6 +1205,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     MLAAttentionSpec: FullAttentionManager,
     SlidingWindowSpec: SlidingWindowManager,
     SlidingWindowMLASpec: SlidingWindowManager,
+    SinkWindowSpec: SinkWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,
     CrossAttentionSpec: CrossAttentionManager,
