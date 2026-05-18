@@ -41,6 +41,7 @@ from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
+    SinkWindowSpec,
     SlidingWindowSpec,
     get_kv_quant_mode,
 )
@@ -589,6 +590,26 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+
+        # Phase 1: --streaming-kv overrides default per-layer choice for all
+        # decoder attention layers, producing SinkWindowSpec uniformly.
+        # Both fields are guaranteed set-together by CacheConfig validator.
+        cache_config = vllm_config.cache_config
+        if cache_config.streaming_kv_start_size is not None:
+            assert not vllm_config.model_config.use_mla, (
+                "MLA is not supported for sink+window (StreamingLLM-style) "
+                "attention."
+            )
+            return SinkWindowSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                kv_quant_mode=quant_mode,
+                sliding_window=cache_config.streaming_kv_recent_size,
+                start_size=cache_config.streaming_kv_start_size,
+            )
+
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"

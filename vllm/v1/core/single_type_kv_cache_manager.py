@@ -654,10 +654,8 @@ class SinkWindowManager(SlidingWindowManager):
     follow-up.
     """
 
-    def __init__(
-        self, kv_cache_spec: SinkWindowSpec, block_pool: BlockPool, **kwargs
-    ) -> None:
-        super().__init__(kv_cache_spec, block_pool, **kwargs)
+    def __init__(self, kv_cache_spec: SinkWindowSpec, **kwargs) -> None:
+        super().__init__(kv_cache_spec, **kwargs)
         self.start_size = kv_cache_spec.start_size
         # cdiv so a partial last sink block still counts as pinned.
         self.start_block_count = cdiv(self.start_size, self.block_size)
@@ -665,13 +663,15 @@ class SinkWindowManager(SlidingWindowManager):
     @classmethod
     def find_longest_cache_hit(
         cls,
-        block_hashes: list[BlockHash],
+        block_hashes: BlockHashList,
         max_length: int,
         kv_cache_group_ids: list[int],
         block_pool: BlockPool,
         kv_cache_spec: KVCacheSpec,
         use_eagle: bool,
+        alignment_tokens: int,
         dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
     ) -> tuple[list[KVCacheBlock], ...]:
         # See class docstring: disable prefix caching for Phase 1.
         assert isinstance(kv_cache_spec, SinkWindowSpec), (
@@ -679,10 +679,18 @@ class SinkWindowManager(SlidingWindowManager):
         )
         return tuple([] for _ in kv_cache_group_ids)
 
-    def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
-        # Same as SlidingWindowManager but stops the eviction loop at
+    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+        # Tell the base eviction NOT to touch our request's blocks — we do
+        # pinned-aware eviction ourselves in `remove_skipped_blocks` so the
+        # base's blind "free everything up to N" loop would corrupt the sinks.
+        return 0
+
+    def remove_skipped_blocks(
+        self, request_id: str, total_computed_tokens: int
+    ) -> None:
+        # Same as SlidingWindowManager's pre-v0.20 eviction but stops at
         # `start_block_count` so the pinned sink prefix is never freed.
-        last_useful_token = num_computed_tokens - self.sliding_window + 1
+        last_useful_token = total_computed_tokens - self.sliding_window + 1
         last_useful_block = last_useful_token // self.block_size
         if last_useful_block <= self.start_block_count:
             # Either the window hasn't grown past the sink budget yet,

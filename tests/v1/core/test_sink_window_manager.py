@@ -39,7 +39,13 @@ def make_spec(block_size=2, sliding_window=4, start_size=4) -> SinkWindowSpec:
 
 
 def make_manager(spec: SinkWindowSpec, block_pool: BlockPool) -> SinkWindowManager:
-    return SinkWindowManager(spec, block_pool, kv_cache_group_id=0)
+    # v0.20.0 manager construction: keyword args, no positional block_pool.
+    return SinkWindowManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+    )
 
 
 # ----------------------------------------------------------------------------

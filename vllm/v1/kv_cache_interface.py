@@ -517,7 +517,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class SinkWindowSpec(AttentionSpec):
     """StreamingLLM-style attention: pin the first `start_size` tokens and the
     last `sliding_window` tokens; the middle is evictable.
