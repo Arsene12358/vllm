@@ -641,6 +641,9 @@ class EngineArgs:
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
 
+    streaming_kv_start_size: int | None = CacheConfig.streaming_kv_start_size
+    streaming_kv_recent_size: int | None = CacheConfig.streaming_kv_recent_size
+
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     enable_mamba_cache_stochastic_rounding: bool = (
         MambaConfig.enable_stochastic_rounding
@@ -1087,6 +1090,14 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-sharing-fast-prefill", **cache_kwargs["kv_sharing_fast_prefill"]
+        )
+        cache_group.add_argument(
+            "--streaming-kv-start-size",
+            **cache_kwargs["streaming_kv_start_size"],
+        )
+        cache_group.add_argument(
+            "--streaming-kv-recent-size",
+            **cache_kwargs["streaming_kv_recent_size"],
         )
         cache_group.add_argument(
             "--mamba-cache-dtype", **cache_kwargs["mamba_cache_dtype"]
@@ -1667,6 +1678,8 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            streaming_kv_start_size=self.streaming_kv_start_size,
+            streaming_kv_recent_size=self.streaming_kv_recent_size,
         )
 
         # TurboQuant: auto-skip first/last 2 layers (boundary protection).
