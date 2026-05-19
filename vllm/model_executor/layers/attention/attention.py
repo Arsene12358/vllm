@@ -600,6 +600,13 @@ class Attention(nn.Module, AttentionLayerBase):
                 "MLA is not supported for sink+window (StreamingLLM-style) "
                 "attention."
             )
+            logger.info(
+                "[streaming-kv] emitting SinkWindowSpec for layer %s "
+                "(start=%d recent=%d)",
+                self.layer_name,
+                cache_config.streaming_kv_start_size,
+                cache_config.streaming_kv_recent_size,
+            )
             return SinkWindowSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
