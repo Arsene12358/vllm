@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -26,6 +27,8 @@ from vllm.v1.kv_cache_interface import (
     TQFullAttentionSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -709,6 +712,17 @@ class SinkWindowManager(SlidingWindowManager):
             removed_blocks.append(blocks[i])
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_blocks)
+        alive_blocks = sum(1 for b in blocks if b != self._null_block)
+        logger.info(
+            "[streaming-kv] eviction req=%s computed=%d total_blocks=%d "
+            "alive=%d (start_pinned=%d) freed=%d",
+            request_id,
+            total_computed_tokens,
+            len(blocks),
+            alive_blocks,
+            self.start_block_count,
+            len(removed_blocks),
+        )
 
 
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
