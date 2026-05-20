@@ -143,6 +143,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    SinkWindowSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -2414,6 +2415,25 @@ class GPUModelRunner(
         Returns:
             int: Length of common prefix in tokens.
         """
+
+        # Phase 2a: SinkWindowSpec forces cascade attention with a pinned
+        # sink prefix of `start_size` tokens, regardless of the scheduler's
+        # prefix-caching common-prefix detection (which is disabled for
+        # SinkWindow groups in Phase 1's SinkWindowManager.find_longest_cache_hit).
+        # The assumption is batch_size == 1 (single continuous stream).
+        if isinstance(kv_cache_spec, SinkWindowSpec):
+            assert len(num_computed_tokens) == 1, (
+                "SinkWindowSpec cascade attention assumes batch_size == 1 "
+                f"(single continuous stream); got {len(num_computed_tokens)} reqs."
+            )
+            # Need at least one token after the pinned sink prefix to make
+            # the suffix pass non-empty.
+            if num_computed_tokens[0] <= kv_cache_spec.start_size:
+                return 0
+            start_size = kv_cache_spec.start_size
+            block_size = kv_cache_spec.block_size
+            sink_blocks = cdiv(start_size, block_size)
+            return sink_blocks * block_size
 
         common_prefix_len = num_common_prefix_blocks * kv_cache_spec.block_size
         if common_prefix_len == 0:

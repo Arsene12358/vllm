@@ -58,7 +58,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import (
     get_kv_cache_layout,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, SinkWindowSpec
 
 logger = init_logger(__name__)
 
@@ -254,6 +254,54 @@ class FlashAttentionMetadata:
     max_num_splits: int = 0
 
     causal: bool = True
+
+
+def _compact_sink_window_block_table(
+    block_table_tensor: torch.Tensor,
+    num_reqs: int,
+    start_block_count: int,
+) -> torch.Tensor:
+    """Splice null blocks out of a SinkWindow request's block table.
+
+    Phase 1's SinkWindowManager leaves block_table[i] in the layout
+        [sink_0 ..., sink_{S-1}, null, null, ..., null, recent_0, ..., recent_{R-1}]
+    where S = start_block_count and any block_id == 0 entry is a null
+    sentinel pointing back to the free pool.
+
+    FA3 cascade attention requires both passes to read a *contiguous* block
+    table — the prefix pass reads block_table[:1, :common_prefix_blocks] and
+    the suffix pass reads block_table[:, common_prefix_blocks:]. We build a
+    compacted view
+        [sink_0, ..., sink_{S-1}, recent_0, ..., recent_{R-1}, 0, 0, ...]
+    that satisfies that contract. Tail is zero-padded.
+
+    The compaction is per-row over only the first ``num_reqs`` rows. Rows
+    that don't have the SinkWindow layout (e.g. a fresh request whose
+    block table doesn't yet have a null gap) are returned unchanged by the
+    same gather logic — pre-eviction rows just have the recent blocks
+    immediately after the sinks already.
+    """
+    if num_reqs == 0:
+        return block_table_tensor
+    compacted = block_table_tensor.clone()
+    head = block_table_tensor[:num_reqs]
+    # For each row, partition into non-null and null. The non-null entries
+    # appear in their original order; the null entries are dropped.
+    non_null_mask = head != 0
+    row_len = head.shape[1]
+    # Compute the destination index of each non-null entry per row.
+    dst_idx = torch.cumsum(non_null_mask.to(torch.int64), dim=1) - 1
+    new_head = torch.zeros_like(head)
+    flat_src = head.reshape(-1)
+    flat_mask = non_null_mask.reshape(-1)
+    flat_dst = (
+        dst_idx.reshape(-1)
+        + (torch.arange(num_reqs, device=head.device).unsqueeze(1) * row_len).reshape(-1)
+    )
+    new_head_flat = new_head.reshape(-1)
+    new_head_flat[flat_dst[flat_mask]] = flat_src[flat_mask]
+    compacted[:num_reqs] = new_head_flat.reshape(num_reqs, row_len)
+    return compacted
 
 
 def _get_sliding_window_configs(
@@ -479,6 +527,25 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
 
+        # Phase 2a: SinkWindow cascade engagement.
+        # The Phase-1 SinkWindowManager nullifies middle blocks in the request's
+        # block_table (layout: [sink_blocks, null_run, recent_blocks]). FA3
+        # cannot read null blocks correctly, so before handing off to the
+        # cascade kernels we compact the block table per row to
+        # [sink_blocks, recent_blocks, ...padding]. We also cap suffix_kv_lens
+        # to recent_size — the cascade code's default `seq_lens - common_prefix_len`
+        # would overcount because seq_lens reflects the uncapped logical length.
+        sink_window_recent_size: int | None = None
+        if use_cascade and isinstance(self.kv_cache_spec, SinkWindowSpec):
+            sink_window_recent_size = self.kv_cache_spec.sliding_window
+            block_table_tensor = _compact_sink_window_block_table(
+                block_table_tensor,
+                num_reqs=num_reqs,
+                start_block_count=cdiv(
+                    self.kv_cache_spec.start_size, self.block_size
+                ),
+            )
+
         if self.dcp_world_size > 1:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
             context_kv_lens = seq_lens - query_lens
@@ -518,6 +585,23 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             )
             # Use GPU tensor directly - no CPU sync needed
             suffix_kv_lens = seq_lens[:num_reqs] - common_prefix_len
+            suffix_max_seq_len = max_seq_len - common_prefix_len
+            if sink_window_recent_size is not None:
+                # Cap suffix to recent_size: the post-eviction recent window
+                # never exceeds this, even though the logical seq_len does.
+                suffix_kv_lens = torch.clamp(
+                    suffix_kv_lens, max=sink_window_recent_size
+                )
+                suffix_max_seq_len = min(
+                    suffix_max_seq_len, sink_window_recent_size
+                )
+                logger.info_once(
+                    "[streaming-kv] cascade attention engaged "
+                    "(common_prefix_len=%d recent_size=%d num_reqs=%d)",
+                    common_prefix_len,
+                    sink_window_recent_size,
+                    num_reqs,
+                )
             prefix_scheduler_metadata = schedule(
                 batch_size=1,
                 cu_query_lens=cu_prefix_query_lens,
@@ -531,7 +615,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 cu_query_lens=query_start_loc,
                 max_query_len=max_query_len,
                 seqlens=suffix_kv_lens,
-                max_seq_len=max_seq_len - common_prefix_len,
+                max_seq_len=suffix_max_seq_len,
                 causal=True,
             )
         else:
