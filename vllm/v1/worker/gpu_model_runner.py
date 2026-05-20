@@ -459,7 +459,12 @@ class GPUModelRunner(
         # Only relevant for models using ALiBi (e.g, MPT)
         self.use_alibi = model_config.uses_alibi
 
-        self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
+        # Phase 2a: streaming-kv requires cascade attention regardless of the
+        # default model-config opt-in (which is off by default in v0.20.0).
+        self.cascade_attn_enabled = (
+            not self.model_config.disable_cascade_attn
+            or self.cache_config.streaming_kv_start_size is not None
+        )
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
 
         # Multi-modal data support
