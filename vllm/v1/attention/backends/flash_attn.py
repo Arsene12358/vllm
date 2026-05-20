@@ -589,11 +589,21 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             if sink_window_recent_size is not None:
                 # Cap suffix to recent_size: the post-eviction recent window
                 # never exceeds this, even though the logical seq_len does.
+                # We must also cap the metadata's `max_seq_len` because the
+                # downstream cascade_attention() call passes
+                #   max_seqlen_k = max_kv_len - common_prefix_len
+                # to the suffix FA3 kernel, which uses it to size
+                # scheduler_metadata. If we cap the scheduler at recent_size
+                # but leave the kernel call's max_seqlen_k uncapped, FA3
+                # raises "scheduler_metadata must have shape (metadata_size)".
                 suffix_kv_lens = torch.clamp(
                     suffix_kv_lens, max=sink_window_recent_size
                 )
                 suffix_max_seq_len = min(
                     suffix_max_seq_len, sink_window_recent_size
+                )
+                max_seq_len = min(
+                    max_seq_len, common_prefix_len + sink_window_recent_size
                 )
                 logger.info_once(
                     "[streaming-kv] cascade attention engaged "
