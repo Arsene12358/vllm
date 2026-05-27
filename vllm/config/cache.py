@@ -98,6 +98,13 @@ class CacheConfig:
     streaming_kv_recent_size: int | None = None
     """StreamingLLM-style recent-window size: number of most-recent tokens
     whose KV entries are kept. See `streaming_kv_start_size`."""
+    streaming_kv_mrope_reindex_a: bool = False
+    """Phase 2b option (a): when True AND streaming_kv_* is set, route
+    SinkWindow cascade attention through a materialize-and-passthrough
+    path so the recent-window K can be re-rotated to virtual positions
+    at compute time (no cache mutation). Default off preserves Phase 2a
+    behavior. Has no effect unless streaming_kv_start_size and
+    streaming_kv_recent_size are also set."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
