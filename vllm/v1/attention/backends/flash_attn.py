@@ -1603,7 +1603,26 @@ def sink_window_cascade_attention(
         mrope_delta_t,
     )
 
-    # === Prefix pass — IDENTICAL to cascade_attention ===
+    # Commit 5: apply Δ rotation to Q as well as recent K, so the suffix-pass
+    # Q-K relative position is preserved. Q during text decode has T=H=W
+    # collapsed, so we apply uniform Δ across all three M-RoPE axes (text
+    # convention). K_recent below stays on (Δ_T, 0, 0) — video convention.
+    # K_sink in the prefix pass is unchanged (sinks are pinned at their
+    # original small positions, no virtual shift).
+    #
+    # Reshape Q to [N, num_heads * head_dim] -> [N, num_heads, head_dim] for
+    # rotation, then back. The query passed in has shape
+    # [num_tokens, num_q_heads, head_dim] already in the FA3 convention.
+    if mrope_delta_t != 0:
+        query = _apply_rope_delta_mrope(
+            query,
+            delta_t=mrope_delta_t,
+            mrope_section=[24, 20, 20],
+            delta_h=mrope_delta_t,
+            delta_w=mrope_delta_t,
+        )
+
+    # === Prefix pass — Q rotated, K_sink unchanged ===
     descale_shape = (cu_prefix_query_lens.shape[0] - 1, key_cache.shape[-2])
     prefix_output, prefix_lse = flash_attn_varlen_func(
         q=query,
