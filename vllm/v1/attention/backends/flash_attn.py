@@ -243,6 +243,12 @@ class FlashAttentionMetadata:
     cu_prefix_query_lens: torch.Tensor | None
     prefix_kv_lens: torch.Tensor | None
     suffix_kv_lens: torch.Tensor | None
+    # Phase 2b option (a): when True, the cascade suffix pass materializes
+    # recent K/V from cache and calls FA3 in non-cached mode so an additional
+    # Δ rotation can be applied before attention. Set only when both
+    # cache_config.streaming_kv_mrope_reindex_a and SinkWindow cascade are
+    # engaged. See sink_window_cascade_attention().
+    use_sink_window_cascade_a: bool = False
 
     # For GQA DCP
     max_dcp_context_kv_len: int | None = None
@@ -607,10 +613,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 )
                 logger.info_once(
                     "[streaming-kv] cascade attention engaged "
-                    "(common_prefix_len=%d recent_size=%d num_reqs=%d)",
+                    "(common_prefix_len=%d recent_size=%d num_reqs=%d mrope_reindex_a=%s)",
                     common_prefix_len,
                     sink_window_recent_size,
                     num_reqs,
+                    self.cache_config.streaming_kv_mrope_reindex_a,
                 )
             prefix_scheduler_metadata = schedule(
                 batch_size=1,
@@ -648,6 +655,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
+        # Phase 2b option (a): only flip on when streaming-kv is enabled AND
+        # the user explicitly opts in. sink_window_recent_size being set
+        # indicates we're in the SinkWindow cascade path.
+        use_sink_window_cascade_a = (
+            sink_window_recent_size is not None
+            and self.cache_config.streaming_kv_mrope_reindex_a
+        )
+
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -664,6 +679,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             cu_prefix_query_lens=cu_prefix_query_lens,
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
+            use_sink_window_cascade_a=use_sink_window_cascade_a,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
@@ -913,7 +929,36 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
 
-        # Cascade attention (rare case).
+        # Cascade attention (rare case). Phase 2b option (a) takes the
+        # materialise-and-passthrough variant when the feature flag is set.
+        if attn_metadata.use_sink_window_cascade_a:
+            sink_window_cascade_attention(
+                output[:num_actual_tokens],
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                cu_query_lens=attn_metadata.query_start_loc,
+                max_query_len=attn_metadata.max_query_len,
+                cu_prefix_query_lens=attn_metadata.cu_prefix_query_lens,
+                prefix_kv_lens=attn_metadata.prefix_kv_lens,
+                suffix_kv_lens=attn_metadata.suffix_kv_lens,
+                max_kv_len=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                alibi_slopes=self.alibi_slopes,
+                sliding_window=self.sliding_window,
+                logits_soft_cap=self.logits_soft_cap,
+                block_table=attn_metadata.block_table,
+                common_prefix_len=attn_metadata.common_prefix_len,
+                max_num_splits=attn_metadata.max_num_splits,
+                fa_version=self.vllm_flash_attn_version,
+                prefix_scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
+                q_descale=layer._q_scale,
+                k_descale=layer._k_scale,
+                v_descale=layer._v_scale,
+                s_aux=self.sinks,
+            )
+            return output
+
         cascade_attention(
             output[:num_actual_tokens],
             query[:num_actual_tokens],
@@ -1314,3 +1359,170 @@ def cascade_attention(
 
     # Merge prefix and suffix outputs, and store the result in output.
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
+
+
+def _materialize_recent_kv(
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    num_common_kv_blocks: int,
+    recent_kv_len: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Gather the recent-window K (or V) from a paged cache into a dense tensor.
+
+    Assumes batch_size == 1 (single continuous stream — see SinkWindowSpec
+    cascade in `_compute_cascade_attn_prefix_len`). After Phase 2a's
+    `_compact_sink_window_block_table`, the recent blocks live at
+    `block_table[0, num_common_kv_blocks : num_common_kv_blocks + R]` where
+    `R = cdiv(recent_kv_len, block_size)`.
+
+    Returns shape `[recent_kv_len, num_kv_heads, head_dim]` (trimmed to the
+    actual token count, dropping the unused tail of the last block).
+    """
+    num_recent_blocks = cdiv(recent_kv_len, block_size)
+    recent_block_ids = block_table[
+        0, num_common_kv_blocks : num_common_kv_blocks + num_recent_blocks
+    ]
+    # cache shape: [num_blocks_total, block_size, num_kv_heads, head_dim]
+    # gather -> [num_recent_blocks, block_size, num_kv_heads, head_dim]
+    gathered = cache[recent_block_ids]
+    # flatten block dim -> [num_recent_blocks * block_size, num_kv_heads, head_dim]
+    flat = gathered.flatten(0, 1)
+    # trim partial-tail block
+    return flat[:recent_kv_len].contiguous()
+
+
+def sink_window_cascade_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    cu_query_lens: torch.Tensor,
+    max_query_len: int,
+    cu_prefix_query_lens: torch.Tensor,
+    prefix_kv_lens: torch.Tensor,
+    suffix_kv_lens: torch.Tensor,
+    max_kv_len: int,
+    softmax_scale: float,
+    alibi_slopes: torch.Tensor | None,
+    sliding_window: tuple[int, int],
+    logits_soft_cap: float,
+    block_table: torch.Tensor,
+    common_prefix_len: int,
+    max_num_splits: int,
+    fa_version: int,
+    prefix_scheduler_metadata: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    s_aux: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Phase 2b option (a): cascade attention with materialised recent K/V.
+
+    Parallel to `cascade_attention()` above. The **prefix pass** (over sinks)
+    is identical — sinks are pinned at their original positions so they need
+    no Δ rotation. The **suffix pass** is replaced by:
+
+      1. Gather recent K and V from the paged cache into contiguous tensors
+         via `_materialize_recent_kv`.
+      2. (Future Δ step) Apply a position re-rotation to the gathered K so
+         it appears at virtual positions. **MVP — Δ=0 — bit-for-bit equivalent
+         to cascade_attention() so the materialise-and-passthrough plumbing
+         can be validated in isolation.**
+      3. Call `flash_attn_varlen_func` in non-cached mode (pass `k=`, `v=`
+         directly; use `cu_seqlens_k` instead of `seqused_k`/`block_table`).
+
+    The merge step is identical.
+
+    Assumes batch_size == 1 (single continuous stream).
+    """
+    assert alibi_slopes is None, "Cascade attention does not support ALiBi."
+    assert sliding_window == (-1, -1), (
+        "Cascade attention does not support sliding window."
+    )
+
+    num_tokens = query.shape[0]
+    block_size = key_cache.shape[-3]
+    assert common_prefix_len % block_size == 0
+    num_common_kv_blocks = common_prefix_len // block_size
+    assert num_common_kv_blocks > 0
+    logger.info_once(
+        "[streaming-kv][option-a] sink_window_cascade_attention engaged "
+        "(common_prefix_len=%d num_tokens=%d block_size=%d)",
+        common_prefix_len,
+        num_tokens,
+        block_size,
+    )
+
+    # === Prefix pass — IDENTICAL to cascade_attention ===
+    descale_shape = (cu_prefix_query_lens.shape[0] - 1, key_cache.shape[-2])
+    prefix_output, prefix_lse = flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_prefix_query_lens,
+        seqused_k=prefix_kv_lens,
+        max_seqlen_q=num_tokens,
+        max_seqlen_k=common_prefix_len,
+        softmax_scale=softmax_scale,
+        causal=False,
+        window_size=list(sliding_window),
+        block_table=block_table[:1],
+        softcap=logits_soft_cap,
+        return_softmax_lse=True,
+        scheduler_metadata=prefix_scheduler_metadata,
+        fa_version=fa_version,
+        q_descale=q_descale.expand(descale_shape) if q_descale is not None else None,
+        k_descale=k_descale.expand(descale_shape) if k_descale is not None else None,
+        v_descale=v_descale.expand(descale_shape) if v_descale is not None else None,
+        s_aux=s_aux,
+        num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
+    )
+
+    # === Suffix pass — MATERIALISED ===
+    # batch_size == 1: the actual recent-K length lives at suffix_kv_lens[0].
+    recent_kv_len = int(suffix_kv_lens[0].item())
+    if recent_kv_len <= 0:
+        # Empty suffix: prefix output is the full answer. Copy through.
+        output.copy_(prefix_output)
+        return output
+
+    recent_k = _materialize_recent_kv(
+        key_cache, block_table, num_common_kv_blocks, recent_kv_len, block_size
+    )
+    recent_v = _materialize_recent_kv(
+        value_cache, block_table, num_common_kv_blocks, recent_kv_len, block_size
+    )
+
+    # TODO(option-a): apply Δ rotation to recent_k here.
+    # For commit 1 we run with Δ=0 to validate the plumbing produces
+    # bit-for-bit identical output to cascade_attention().
+
+    cu_seqlens_k = torch.tensor(
+        [0, recent_kv_len], dtype=torch.int32, device=query.device
+    )
+    # In non-cached mode (k/v as dense tensors) FA3 derives the per-request
+    # descale shape from the head dim of the input tensors directly; the
+    # descale tensors keep the same `[num_reqs, num_kv_heads]` shape.
+    suffix_output, suffix_lse = flash_attn_varlen_func(
+        q=query,
+        k=recent_k,
+        v=recent_v,
+        cu_seqlens_q=cu_query_lens,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=recent_kv_len,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=list(sliding_window),
+        softcap=logits_soft_cap,
+        return_softmax_lse=True,
+        fa_version=fa_version,
+        q_descale=q_descale if q_descale is not None else None,
+        k_descale=k_descale if k_descale is not None else None,
+        v_descale=v_descale if v_descale is not None else None,
+        num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
+    )
+
+    merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
+    return output
