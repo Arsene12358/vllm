@@ -1382,6 +1382,59 @@ def cascade_attention(
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
 
 
+def _apply_rope_delta_text_only(
+    k: torch.Tensor,
+    delta: int,
+    rope_theta: float = 1_000_000.0,
+    is_neox_style: bool = True,
+) -> torch.Tensor:
+    """Apply an additional R(Delta) rotation to K, text-only single-axis.
+
+    For Phase 2b option (a). Used to map materialised recent K to virtual
+    positions before the suffix attention pass:
+      K_virtual = R(virtual_pos) K_raw
+                = R(Delta) R(original_pos) K_raw
+                = R(Delta) K_stored
+    so we just apply the additional Delta rotation to whatever is in the cache.
+
+    Limitations of this MVP:
+      - text-only: assumes T = H = W (vision tokens have different per-axis
+        positions; the per-axis Delta_T/H/W form lands in a later commit).
+      - rope_theta and neox-style hardcoded for Qwen3-Omni; we can plumb
+        these from the model config when generalising.
+
+    Args:
+      k: shape [N, num_kv_heads, head_dim]
+      delta: scalar integer Delta to apply uniformly to all N tokens.
+    """
+    if delta == 0:
+        return k
+
+    head_dim = k.shape[-1]
+    half_dim = head_dim // 2
+
+    # inv_freq[i] = rope_theta^(-2i/head_dim) for i in [0, half_dim).
+    freq_idx = torch.arange(half_dim, dtype=torch.float32, device=k.device)
+    inv_freq = 1.0 / (rope_theta ** (2.0 * freq_idx / head_dim))
+    angles = float(delta) * inv_freq                          # [half_dim]
+    cos = angles.cos().to(k.dtype)
+    sin = angles.sin().to(k.dtype)
+
+    if is_neox_style:
+        # neox: pairs (K[..., :half], K[..., half:]).
+        k1, k2 = k.chunk(2, dim=-1)
+        k1_new = cos * k1 - sin * k2
+        k2_new = sin * k1 + cos * k2
+        return torch.cat([k1_new, k2_new], dim=-1)
+    # interleaved-pair (Llama-style): pairs (K[..., 2i], K[..., 2i+1]).
+    k_pairs = k.view(*k.shape[:-1], half_dim, 2)
+    k1 = k_pairs[..., 0]
+    k2 = k_pairs[..., 1]
+    k1_new = cos * k1 - sin * k2
+    k2_new = sin * k1 + cos * k2
+    return torch.stack([k1_new, k2_new], dim=-1).view_as(k)
+
+
 def _materialize_recent_kv(
     cache: torch.Tensor,
     block_table: torch.Tensor,
@@ -1517,15 +1570,12 @@ def sink_window_cascade_attention(
         value_cache, block_table, num_common_kv_blocks, recent_kv_len, block_size
     )
 
-    # Commit 2: Δ value is computed and plumbed via the metadata, but the
-    # rotation kernel itself lands in commit 3. For now, refuse non-zero Δ
-    # rather than silently produce wrong output for evicting sequences.
+    # Commit 3: apply Δ rotation to materialised recent K.
+    # For an in-window sequence Δ_T == 0 and the call is a no-op.
+    # For an evicting sequence Δ_T < 0 and recent K gets remapped to
+    # virtual positions inside [start_size, start_size + recent_size).
     if mrope_delta_t != 0:
-        raise NotImplementedError(
-            f"sink_window_cascade_attention: mrope_delta_t={mrope_delta_t} "
-            f"requires the rotation kernel (commit 3, pending). Option (a) "
-            f"currently supports only in-window sequences where Δ_T == 0."
-        )
+        recent_k = _apply_rope_delta_text_only(recent_k, mrope_delta_t)
 
     cu_seqlens_k = torch.tensor(
         [0, recent_kv_len], dtype=torch.int32, device=query.device
