@@ -249,6 +249,11 @@ class FlashAttentionMetadata:
     # cache_config.streaming_kv_mrope_reindex_a and SinkWindow cascade are
     # engaged. See sink_window_cascade_attention().
     use_sink_window_cascade_a: bool = False
+    # M-RoPE T-axis Δ to apply to materialised recent K. Currently text-only
+    # single-axis (H/W axes always have Δ=0). Computed as
+    #   Δ = min(0, start_size + recent_size - total_computed)
+    # which is 0 in-window (no eviction) and negative when the window is full.
+    mrope_delta_t: int = 0
 
     # For GQA DCP
     max_dcp_context_kv_len: int | None = None
@@ -630,6 +635,20 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             sink_window_recent_size is not None
             and self.cache_config.streaming_kv_mrope_reindex_a
         )
+        # Compute Δ_T for the virtual-position scheme. Δ = 0 means the
+        # cache positions already lie in the bounded virtual range
+        # (in-window: no eviction has happened). Δ < 0 when the recent
+        # window has shifted past start_size + recent_size, requiring
+        # a corrective rotation by that amount.
+        mrope_delta_t = 0
+        if use_sink_window_cascade_a and num_reqs >= 1:
+            assert self.cache_config.streaming_kv_start_size is not None
+            assert sink_window_recent_size is not None
+            total_computed = int(seq_lens[0].item())
+            virtual_bound = (
+                self.cache_config.streaming_kv_start_size + sink_window_recent_size
+            )
+            mrope_delta_t = min(0, virtual_bound - total_computed)
 
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -648,6 +667,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
             use_sink_window_cascade_a=use_sink_window_cascade_a,
+            mrope_delta_t=mrope_delta_t,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
@@ -919,6 +939,7 @@ class FlashAttentionImpl(AttentionImpl):
                 common_prefix_len=attn_metadata.common_prefix_len,
                 max_num_splits=attn_metadata.max_num_splits,
                 fa_version=self.vllm_flash_attn_version,
+                mrope_delta_t=attn_metadata.mrope_delta_t,
                 prefix_scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
                 q_descale=layer._q_scale,
                 k_descale=layer._k_scale,
@@ -1379,6 +1400,7 @@ def sink_window_cascade_attention(
     common_prefix_len: int,
     max_num_splits: int,
     fa_version: int,
+    mrope_delta_t: int = 0,
     prefix_scheduler_metadata: torch.Tensor | None = None,
     q_descale: torch.Tensor | None = None,
     k_descale: torch.Tensor | None = None,
@@ -1416,10 +1438,11 @@ def sink_window_cascade_attention(
     assert num_common_kv_blocks > 0
     logger.info_once(
         "[streaming-kv][option-a] sink_window_cascade_attention engaged "
-        "(common_prefix_len=%d num_tokens=%d block_size=%d)",
+        "(common_prefix_len=%d num_tokens=%d block_size=%d mrope_delta_t=%d)",
         common_prefix_len,
         num_tokens,
         block_size,
+        mrope_delta_t,
     )
 
     # === Prefix pass — IDENTICAL to cascade_attention ===
@@ -1462,9 +1485,15 @@ def sink_window_cascade_attention(
         value_cache, block_table, num_common_kv_blocks, recent_kv_len, block_size
     )
 
-    # TODO(option-a): apply Δ rotation to recent_k here.
-    # For commit 1 we run with Δ=0 to validate the plumbing produces
-    # bit-for-bit identical output to cascade_attention().
+    # Commit 2: Δ value is computed and plumbed via the metadata, but the
+    # rotation kernel itself lands in commit 3. For now, refuse non-zero Δ
+    # rather than silently produce wrong output for evicting sequences.
+    if mrope_delta_t != 0:
+        raise NotImplementedError(
+            f"sink_window_cascade_attention: mrope_delta_t={mrope_delta_t} "
+            f"requires the rotation kernel (commit 3, pending). Option (a) "
+            f"currently supports only in-window sequences where Δ_T == 0."
+        )
 
     cu_seqlens_k = torch.tensor(
         [0, recent_kv_len], dtype=torch.int32, device=query.device
