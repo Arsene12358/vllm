@@ -1382,6 +1382,79 @@ def cascade_attention(
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
 
 
+def _apply_rope_delta_mrope(
+    k: torch.Tensor,
+    delta_t: int,
+    mrope_section: list[int],
+    rope_theta: float = 1_000_000.0,
+    is_neox_style: bool = True,
+    delta_h: int = 0,
+    delta_w: int = 0,
+) -> torch.Tensor:
+    """Apply per-axis R(Δ_T, Δ_H, Δ_W) rotation to K under interleaved M-RoPE.
+
+    For Phase 2b option (a) handling mixed video/text recent windows.
+    Defaults to Δ_H = Δ_W = 0, matching the production case where only the
+    T-axis (frame-index) anchor advances as the recent window slides. Text
+    tokens (where the model expects all three axes to shift uniformly) are
+    partially under-rotated by this scheme — acceptable for streams where
+    the recent window is dominated by video.
+
+    Interleaved layout (`mrope_interleaved=True`, the Qwen3-Omni default):
+    pair index `i` ∈ [0, half_dim) corresponds to:
+      - H axis if i ∈ {1, 4, 7, ..., 1 + 3*(mrope_section[1]-1)}
+      - W axis if i ∈ {2, 5, 8, ..., 2 + 3*(mrope_section[2]-1)}
+      - T axis otherwise (= {0, 3, 6, ...} plus the all-T tail past
+        3*max(mrope_section[1], mrope_section[2]))
+
+    Args:
+      k: shape [N, num_kv_heads, head_dim]
+      delta_t/h/w: scalar integer Δ per axis (uniformly applied to all N
+        tokens — this is correct because the window slides by the same
+        amount for every cached token at a given eviction event).
+      mrope_section: [T_count, H_count, W_count] summing to half_dim.
+    """
+    if delta_t == 0 and delta_h == 0 and delta_w == 0:
+        return k
+
+    head_dim = k.shape[-1]
+    half_dim = head_dim // 2
+    assert sum(mrope_section) == half_dim, (
+        f"mrope_section {mrope_section} doesn't sum to half_dim={half_dim}"
+    )
+    sec_t, sec_h, sec_w = mrope_section
+
+    # Build per-pair Δ values according to interleaved layout.
+    delta_per_pair = torch.full(
+        (half_dim,), float(delta_t), dtype=torch.float32, device=k.device
+    )
+    h_positions = [i for i in range(1, 1 + sec_h * 3, 3) if i < half_dim]
+    w_positions = [i for i in range(2, 2 + sec_w * 3, 3) if i < half_dim]
+    if h_positions:
+        delta_per_pair[h_positions] = float(delta_h)
+    if w_positions:
+        delta_per_pair[w_positions] = float(delta_w)
+
+    # inv_freq[i] = rope_theta^(-2i/head_dim).
+    freq_idx = torch.arange(half_dim, dtype=torch.float32, device=k.device)
+    inv_freq = 1.0 / (rope_theta ** (2.0 * freq_idx / head_dim))
+    angles = delta_per_pair * inv_freq                         # [half_dim]
+    cos = angles.cos().to(k.dtype)
+    sin = angles.sin().to(k.dtype)
+
+    if is_neox_style:
+        k1, k2 = k.chunk(2, dim=-1)
+        k1_new = cos * k1 - sin * k2
+        k2_new = sin * k1 + cos * k2
+        return torch.cat([k1_new, k2_new], dim=-1)
+    k_pairs = k.view(*k.shape[:-1], half_dim, 2)
+    k1 = k_pairs[..., 0]
+    k2 = k_pairs[..., 1]
+    k1_new = cos * k1 - sin * k2
+    k2_new = sin * k1 + cos * k2
+    return torch.stack([k1_new, k2_new], dim=-1).view_as(k)
+
+
 def _apply_rope_delta_text_only(
     k: torch.Tensor,
     delta: int,
@@ -1570,12 +1643,19 @@ def sink_window_cascade_attention(
         value_cache, block_table, num_common_kv_blocks, recent_kv_len, block_size
     )
 
-    # Commit 3: apply Δ rotation to materialised recent K.
-    # For an in-window sequence Δ_T == 0 and the call is a no-op.
-    # For an evicting sequence Δ_T < 0 and recent K gets remapped to
-    # virtual positions inside [start_size, start_size + recent_size).
+    # Commit 4: per-axis M-RoPE Δ rotation. Δ_T shifts; Δ_H=Δ_W=0.
+    # For an in-window sequence Δ_T == 0 and the call is a no-op (early
+    # return inside the helper). For an evicting sequence, only the T-axis
+    # band of head_dim is rotated under the interleaved layout — H/W
+    # bands stay (per-frame spatial layout doesn't change with window slide).
+    # mrope_section hardcoded to Qwen3-Omni's [24, 20, 20]; generalise
+    # via vllm_config plumbing when needed.
     if mrope_delta_t != 0:
-        recent_k = _apply_rope_delta_text_only(recent_k, mrope_delta_t)
+        recent_k = _apply_rope_delta_mrope(
+            recent_k,
+            delta_t=mrope_delta_t,
+            mrope_section=[24, 20, 20],
+        )
 
     cu_seqlens_k = torch.tensor(
         [0, recent_kv_len], dtype=torch.int32, device=query.device
