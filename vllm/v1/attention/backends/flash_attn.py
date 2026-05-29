@@ -256,54 +256,6 @@ class FlashAttentionMetadata:
     causal: bool = True
 
 
-def _compact_sink_window_block_table(
-    block_table_tensor: torch.Tensor,
-    num_reqs: int,
-    start_block_count: int,
-) -> torch.Tensor:
-    """Splice null blocks out of a SinkWindow request's block table.
-
-    Phase 1's SinkWindowManager leaves block_table[i] in the layout
-        [sink_0 ..., sink_{S-1}, null, null, ..., null, recent_0, ..., recent_{R-1}]
-    where S = start_block_count and any block_id == 0 entry is a null
-    sentinel pointing back to the free pool.
-
-    FA3 cascade attention requires both passes to read a *contiguous* block
-    table — the prefix pass reads block_table[:1, :common_prefix_blocks] and
-    the suffix pass reads block_table[:, common_prefix_blocks:]. We build a
-    compacted view
-        [sink_0, ..., sink_{S-1}, recent_0, ..., recent_{R-1}, 0, 0, ...]
-    that satisfies that contract. Tail is zero-padded.
-
-    The compaction is per-row over only the first ``num_reqs`` rows. Rows
-    that don't have the SinkWindow layout (e.g. a fresh request whose
-    block table doesn't yet have a null gap) are returned unchanged by the
-    same gather logic — pre-eviction rows just have the recent blocks
-    immediately after the sinks already.
-    """
-    if num_reqs == 0:
-        return block_table_tensor
-    compacted = block_table_tensor.clone()
-    head = block_table_tensor[:num_reqs]
-    # For each row, partition into non-null and null. The non-null entries
-    # appear in their original order; the null entries are dropped.
-    non_null_mask = head != 0
-    row_len = head.shape[1]
-    # Compute the destination index of each non-null entry per row.
-    dst_idx = torch.cumsum(non_null_mask.to(torch.int64), dim=1) - 1
-    new_head = torch.zeros_like(head)
-    flat_src = head.reshape(-1)
-    flat_mask = non_null_mask.reshape(-1)
-    flat_dst = (
-        dst_idx.reshape(-1)
-        + (torch.arange(num_reqs, device=head.device).unsqueeze(1) * row_len).reshape(-1)
-    )
-    new_head_flat = new_head.reshape(-1)
-    new_head_flat[flat_dst[flat_mask]] = flat_src[flat_mask]
-    compacted[:num_reqs] = new_head_flat.reshape(num_reqs, row_len)
-    return compacted
-
-
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
 ) -> set[tuple[int, int] | None]:
@@ -527,24 +479,12 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
 
-        # Phase 2a: SinkWindow cascade engagement.
-        # The Phase-1 SinkWindowManager nullifies middle blocks in the request's
-        # block_table (layout: [sink_blocks, null_run, recent_blocks]). FA3
-        # cannot read null blocks correctly, so before handing off to the
-        # cascade kernels we compact the block table per row to
-        # [sink_blocks, recent_blocks, ...padding]. We also cap suffix_kv_lens
-        # to recent_size — the cascade code's default `seq_lens - common_prefix_len`
-        # would overcount because seq_lens reflects the uncapped logical length.
+        # SinkWindow cascade engagement. The recent-window block-table rebuild
+        # and suffix metadata are handled in the `use_cascade` branch below
+        # (see the StreamingLLM recent-window read comment).
         sink_window_recent_size: int | None = None
         if use_cascade and isinstance(self.kv_cache_spec, SinkWindowSpec):
             sink_window_recent_size = self.kv_cache_spec.sliding_window
-            block_table_tensor = _compact_sink_window_block_table(
-                block_table_tensor,
-                num_reqs=num_reqs,
-                start_block_count=cdiv(
-                    self.kv_cache_spec.start_size, self.block_size
-                ),
-            )
 
         if self.dcp_world_size > 1:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
@@ -596,15 +536,43 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 # scheduler_metadata. If we cap the scheduler at recent_size
                 # but leave the kernel call's max_seqlen_k uncapped, FA3
                 # raises "scheduler_metadata must have shape (metadata_size)".
-                suffix_kv_lens = torch.clamp(
-                    suffix_kv_lens, max=sink_window_recent_size
-                )
-                suffix_max_seq_len = min(
-                    suffix_max_seq_len, sink_window_recent_size
-                )
-                max_seq_len = min(
-                    max_seq_len, common_prefix_len + sink_window_recent_size
-                )
+                # StreamingLLM recent-window read for the cascade SUFFIX pass.
+                #
+                # The block_table this builder receives is the full per-request
+                # table indexed by logical block. We rebuild the row as
+                #   [sink_blocks ++ recent_TAIL_blocks ++ pad]
+                # so the cascade suffix pass (which reads block_table[:,
+                # num_common_kv_blocks:] front-to-back) lands on the true recent
+                # window: the last recent_size tokens, *including the newest /
+                # just-generated token*. The evicted middle blocks are simply
+                # not read.
+                #
+                # Anchoring to the tail (rather than reading the first
+                # recent_size tokens after the sinks) is required: a front read
+                # returns the OLDEST tokens — for a long prompt that is the
+                # start of the input, and during decode it drops the newest
+                # block, so the model cannot see its own recent output and the
+                # generation collapses to EOS. batch_size == 1 is asserted for
+                # SinkWindowSpec.
+                bs = self.block_size
+                sink_blocks = common_prefix_len // bs
+                recent_blocks = sink_window_recent_size // bs
+                total_kv = int(seq_lens[0].item())
+                num_valid_blocks = cdiv(total_kv, bs)
+                tail_start = max(sink_blocks, num_valid_blocks - recent_blocks)
+                row = block_table_tensor[0]
+                new_row = torch.zeros_like(row)
+                new_row[:sink_blocks] = row[:sink_blocks]
+                tail = row[tail_start:num_valid_blocks]
+                new_row[sink_blocks : sink_blocks + tail.shape[0]] = tail
+                block_table_tensor = block_table_tensor.clone()
+                block_table_tensor[0] = new_row
+                # Anchor the suffix metadata to the tokens the tail slice
+                # actually covers (the last block may be partial).
+                recent_tokens = total_kv - tail_start * bs
+                suffix_kv_lens = torch.full_like(suffix_kv_lens, recent_tokens)
+                suffix_max_seq_len = recent_tokens
+                max_seq_len = common_prefix_len + recent_tokens
                 logger.info_once(
                     "[streaming-kv] cascade attention engaged "
                     "(common_prefix_len=%d recent_size=%d num_reqs=%d)",
