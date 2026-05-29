@@ -538,15 +538,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             suffix_kv_lens = seq_lens[:num_reqs] - common_prefix_len
             suffix_max_seq_len = max_seq_len - common_prefix_len
             if sink_window_recent_size is not None:
-                # Cap suffix to recent_size: the post-eviction recent window
-                # never exceeds this, even though the logical seq_len does.
-                # We must also cap the metadata's `max_seq_len` because the
-                # downstream cascade_attention() call passes
-                #   max_seqlen_k = max_kv_len - common_prefix_len
-                # to the suffix FA3 kernel, which uses it to size
-                # scheduler_metadata. If we cap the scheduler at recent_size
-                # but leave the kernel call's max_seqlen_k uncapped, FA3
-                # raises "scheduler_metadata must have shape (metadata_size)".
                 # StreamingLLM recent-window read for the cascade SUFFIX pass.
                 #
                 # The block_table this builder receives is the full per-request
@@ -586,7 +577,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 max_seq_len = common_prefix_len + recent_tokens
                 logger.info_once(
                     "[streaming-kv] cascade attention engaged "
-                    "(common_prefix_len=%d recent_size=%d num_reqs=%d mrope_reindex_a=%s)",
+                    "(common_prefix_len=%d recent_size=%d num_reqs=%d "
+                    "mrope_reindex_a=%s)",
                     common_prefix_len,
                     sink_window_recent_size,
                     num_reqs,
