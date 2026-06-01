@@ -249,8 +249,8 @@ class FlashAttentionMetadata:
     # cache_config.streaming_kv_mrope_reindex_a and SinkWindow cascade are
     # engaged. See sink_window_cascade_attention().
     use_sink_window_cascade_a: bool = False
-    # M-RoPE T-axis Δ to apply to materialised recent K. Currently text-only
-    # single-axis (H/W axes always have Δ=0). Computed as
+    # M-RoPE Δ applied (on all three axes) to the materialised recent K to
+    # re-index it into the bounded virtual position window. Computed as
     #   Δ = min(0, start_size + recent_size - total_computed)
     # which is 0 in-window (no eviction) and negative when the window is full.
     mrope_delta_t: int = 0
@@ -1353,12 +1353,12 @@ def _apply_rope_delta_mrope(
 ) -> torch.Tensor:
     """Apply per-axis R(Δ_T, Δ_H, Δ_W) rotation to K under interleaved M-RoPE.
 
-    For Phase 2b option (a) handling mixed video/text recent windows.
-    Defaults to Δ_H = Δ_W = 0, matching the production case where only the
-    T-axis (frame-index) anchor advances as the recent window slides. Text
-    tokens (where the model expects all three axes to shift uniformly) are
-    partially under-rotated by this scheme — acceptable for streams where
-    the recent window is dominated by video.
+    For Phase 2b option (a) re-indexing of the recent window. Callers pass
+    Δ_T = Δ_H = Δ_W = Δ: Qwen's M-RoPE puts the shared sequence-position base
+    on all three axes for every token (text = (p,p,p); video = base + grid
+    offset on each axis), so a window shift moves the base on all three axes
+    uniformly. Intra-frame grid offsets are differences and are preserved
+    regardless. (Δ_H = Δ_W = 0 remains available as a T-only fallback.)
 
     Interleaved layout (`mrope_interleaved=True`, the Qwen3-Omni default):
     pair index `i` ∈ [0, half_dim) corresponds to:
@@ -1622,18 +1622,25 @@ def sink_window_cascade_attention(
         value_cache, block_table, num_common_kv_blocks, recent_kv_len, block_size
     )
 
-    # Commit 4: per-axis M-RoPE Δ rotation. Δ_T shifts; Δ_H=Δ_W=0.
-    # For an in-window sequence Δ_T == 0 and the call is a no-op (early
-    # return inside the helper). For an evicting sequence, only the T-axis
-    # band of head_dim is rotated under the interleaved layout — H/W
-    # bands stay (per-frame spatial layout doesn't change with window slide).
-    # mrope_section hardcoded to Qwen3-Omni's [24, 20, 20]; generalise
-    # via vllm_config plumbing when needed.
+    # Re-index the recent window by Δ on ALL THREE M-RoPE axes (Δ_T=Δ_H=Δ_W),
+    # matching the Q rotation above. Qwen's M-RoPE assigns multimodal tokens
+    # `grid_index + st_idx` on every axis (see get_rope_index), so the shared
+    # sequence-position base `st_idx` lives in T, H and W alike — for both text
+    # (T=H=W=pos) and video (base + small grid offset) tokens. Shifting only T
+    # would leave H/W off by Δ for video tokens (intra-frame grid offsets are
+    # preserved either way, since they are differences), corrupting recent
+    # attention. The Δ cancels against Q for the recent window (relative
+    # position preserved) while the unshifted sinks stay at a bounded relative
+    # distance. For an in-window sequence Δ == 0 → no-op.
+    # mrope_section hardcoded to Qwen3-Omni's [24, 20, 20]; plumb from
+    # vllm_config when generalising.
     if mrope_delta_t != 0:
         recent_k = _apply_rope_delta_mrope(
             recent_k,
             delta_t=mrope_delta_t,
             mrope_section=[24, 20, 20],
+            delta_h=mrope_delta_t,
+            delta_w=mrope_delta_t,
         )
 
     cu_seqlens_k = torch.tensor(
