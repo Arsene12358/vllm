@@ -250,9 +250,12 @@ class FlashAttentionMetadata:
     # engaged. See sink_window_cascade_attention().
     use_sink_window_cascade_a: bool = False
     # M-RoPE Δ applied (on all three axes) to the materialised recent K to
-    # re-index it into the bounded virtual position window. Computed as
-    #   Δ = min(0, start_size + recent_size - total_computed)
-    # which is 0 in-window (no eviction) and negative when the window is full.
+    # re-index it into the trained position range. Activation-gated:
+    #   safe_bound = max_position_embeddings - recent_size
+    #   Δ = min(0, safe_bound - total_computed)
+    # so Δ == 0 (no re-indexing) while the decode position is in-range, and
+    # Δ < 0 only once it nears the trained range — clamping the effective
+    # query position at safe_bound. See build() for the rationale.
     mrope_delta_t: int = 0
 
     # For GQA DCP
@@ -627,20 +630,33 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             sink_window_recent_size is not None
             and self.cache_config.streaming_kv_mrope_reindex_a
         )
-        # Compute Δ_T for the virtual-position scheme. Δ = 0 means the
-        # cache positions already lie in the bounded virtual range
-        # (in-window: no eviction has happened). Δ < 0 when the recent
-        # window has shifted past start_size + recent_size, requiring
-        # a corrective rotation by that amount.
+        # Compute Δ_T for the virtual-position scheme, with an *activation
+        # gate*. Δ = 0 while the decode position is still inside the model's
+        # trained position range (max_position_embeddings): there the true
+        # positions are in-range and the model handles the sink↔recent gap
+        # natively (it was trained on long, gapped contexts), so re-indexing
+        # would only distort distances that didn't need changing — which
+        # collapses greedy decoding into a repetition loop (jobs 1808/1809).
+        # Once total_computed passes `safe_bound` (just below the trained
+        # range), Δ < 0 clamps the effective query position at `safe_bound`,
+        # keeping the decode→sink relative distance inside the trained range.
+        # The transition is continuous: at total == safe_bound, Δ == 0 and
+        # q_eff == safe_bound; past it q_eff stays pinned at safe_bound while
+        # the recent window's effective positions slide down with it.
         mrope_delta_t = 0
         if use_sink_window_cascade_a and num_reqs >= 1:
-            assert self.cache_config.streaming_kv_start_size is not None
             assert sink_window_recent_size is not None
             total_computed = int(seq_lens[0].item())
-            virtual_bound = (
-                self.cache_config.streaming_kv_start_size + sink_window_recent_size
+            max_pos = getattr(
+                self.model_config.hf_text_config,
+                "max_position_embeddings",
+                None,
             )
-            mrope_delta_t = min(0, virtual_bound - total_computed)
+            if max_pos is not None:
+                # Reserve `recent_size` of headroom below the trained range so
+                # the whole recent window's effective positions stay in-range.
+                safe_bound = max_pos - sink_window_recent_size
+                mrope_delta_t = min(0, safe_bound - total_computed)
 
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -1563,12 +1579,11 @@ def sink_window_cascade_attention(
         mrope_delta_t,
     )
 
-    # Commit 5: apply Δ rotation to Q as well as recent K, so the suffix-pass
-    # Q-K relative position is preserved. Q during text decode has T=H=W
-    # collapsed, so we apply uniform Δ across all three M-RoPE axes (text
-    # convention). K_recent below stays on (Δ_T, 0, 0) — video convention.
-    # K_sink in the prefix pass is unchanged (sinks are pinned at their
-    # original small positions, no virtual shift).
+    # Apply Δ rotation to Q as well as recent K, so the suffix-pass Q-K
+    # relative position is preserved. Both Q and K_recent are shifted by Δ on
+    # all three M-RoPE axes (Δ_T=Δ_H=Δ_W); see the recent-K rotation below for
+    # why every axis must shift. K_sink in the prefix pass is unchanged (sinks
+    # are pinned at their original small positions, no virtual shift).
     #
     # Reshape Q to [N, num_heads * head_dim] -> [N, num_heads, head_dim] for
     # rotation, then back. The query passed in has shape
