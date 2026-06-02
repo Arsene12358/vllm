@@ -105,6 +105,14 @@ class CacheConfig:
     at compute time (no cache mutation). Default off preserves Phase 2a
     behavior. Has no effect unless streaming_kv_start_size and
     streaming_kv_recent_size are also set."""
+    streaming_kv_bounded_positions: bool = False
+    """Option B Stage 1: when True AND streaming_kv_* is set, pin every decode
+    token's M-RoPE position at the bounded window front (start+recent) and
+    re-rotate the recent window to its bounded virtual slots with a per-token
+    Delta, so the model rotary never indexes past start+recent during decode
+    (unbounded generation with bounded cos/sin). Mutually exclusive with
+    streaming_kv_mrope_reindex_a. Has no effect unless streaming_kv_start_size
+    and streaming_kv_recent_size are also set."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
@@ -306,5 +314,16 @@ class CacheConfig:
                 raise ValueError(
                     f"streaming_kv_recent_size must be > 0, got "
                     f"{self.streaming_kv_recent_size}"
+                )
+        if self.streaming_kv_bounded_positions:
+            if not have_start:
+                raise ValueError(
+                    "streaming_kv_bounded_positions requires "
+                    "streaming_kv_start_size and streaming_kv_recent_size."
+                )
+            if self.streaming_kv_mrope_reindex_a:
+                raise ValueError(
+                    "streaming_kv_bounded_positions and "
+                    "streaming_kv_mrope_reindex_a are mutually exclusive."
                 )
         return self
