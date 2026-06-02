@@ -2549,14 +2549,38 @@ class GPUModelRunner(
                 dst_start = mrope_pos_ptr
                 dst_end = mrope_pos_ptr + completion_part_len
 
-                assert req.mrope_position_delta is not None
-                MRotaryEmbedding.get_next_input_positions_tensor(
-                    out=self.mrope_positions.np,
-                    out_offset=dst_start,
-                    mrope_position_delta=req.mrope_position_delta,
-                    context_len=num_computed_tokens + prompt_part_len,
-                    num_new_tokens=completion_part_len,
-                )
+                cc = self.cache_config
+                if (
+                    cc.streaming_kv_bounded_positions
+                    and cc.streaming_kv_start_size is not None
+                    and cc.streaming_kv_recent_size is not None
+                ):
+                    # Option B Stage 1: pin every decode token's M-RoPE position
+                    # at the bounded window front (start + recent) on all three
+                    # axes, so the model rotary never indexes past start+recent
+                    # during decode (unbounded generation, bounded cos/sin). The
+                    # recent window is re-rotated to its virtual slots in the
+                    # attention backend (see sink_window_cascade_attention).
+                    front = (
+                        cc.streaming_kv_start_size + cc.streaming_kv_recent_size
+                    )
+                    self.mrope_positions.np[:, dst_start:dst_end] = front
+                    logger.info_once(
+                        "[streaming-kv][bounded] decode M-RoPE positions pinned "
+                        "at front=%d (start=%d recent=%d)",
+                        front,
+                        cc.streaming_kv_start_size,
+                        cc.streaming_kv_recent_size,
+                    )
+                else:
+                    assert req.mrope_position_delta is not None
+                    MRotaryEmbedding.get_next_input_positions_tensor(
+                        out=self.mrope_positions.np,
+                        out_offset=dst_start,
+                        mrope_position_delta=req.mrope_position_delta,
+                        context_len=num_computed_tokens + prompt_part_len,
+                        num_new_tokens=completion_part_len,
+                    )
 
                 mrope_pos_ptr += completion_part_len
 
