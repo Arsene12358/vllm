@@ -1431,6 +1431,41 @@ def _apply_rope_delta_mrope(
     return torch.stack([k1_new, k2_new], dim=-1).view_as(k)
 
 
+def _apply_rope_delta_mrope_pertoken(
+    k: torch.Tensor,
+    delta_per_token: torch.Tensor,
+    rope_theta: float = 1_000_000.0,
+    is_neox_style: bool = True,
+) -> torch.Tensor:
+    """Per-token uniform (all-axis) M-RoPE Δ rotation.
+
+    Token i is rotated by ``delta_per_token[i]`` on every frequency pair (all
+    three M-RoPE axes get the same Δ — the validated all-axis convention from
+    option (a)). Option B Stage 1 needs this because, under bounded virtual
+    positions, each recent-window token requires a *different* Δ to reach its
+    virtual slot (prefill-written tokens differ from decode-written ones), so Δ
+    is a per-token vector rather than option (a)'s scalar.
+
+    Args:
+      k: [N, num_kv_heads, head_dim]
+      delta_per_token: [N] integer/float Δ for each of the N tokens.
+    """
+    head_dim = k.shape[-1]
+    half_dim = head_dim // 2
+    freq_idx = torch.arange(half_dim, dtype=torch.float32, device=k.device)
+    inv_freq = 1.0 / (rope_theta ** (2.0 * freq_idx / head_dim))     # [half_dim]
+    angles = delta_per_token.to(torch.float32)[:, None] * inv_freq[None, :]  # [N, half_dim]
+    cos = angles.cos().to(k.dtype)[:, None, :]   # [N, 1, half_dim] (broadcast over heads)
+    sin = angles.sin().to(k.dtype)[:, None, :]
+    if is_neox_style:
+        k1, k2 = k.chunk(2, dim=-1)
+        return torch.cat([cos * k1 - sin * k2, sin * k1 + cos * k2], dim=-1)
+    k_pairs = k.view(*k.shape[:-1], half_dim, 2)
+    k1 = k_pairs[..., 0]
+    k2 = k_pairs[..., 1]
+    return torch.stack([cos * k1 - sin * k2, sin * k1 + cos * k2], dim=-1).view_as(k)
+
+
 def _apply_rope_delta_text_only(
     k: torch.Tensor,
     delta: int,
