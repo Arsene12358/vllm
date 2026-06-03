@@ -2191,6 +2191,7 @@ class GPUModelRunner(
             causal=True,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
+            num_prompt_tokens=self.input_batch.num_prompt_tokens[:num_reqs_padded],
         )
 
         if self.dcp_world_size > 1:

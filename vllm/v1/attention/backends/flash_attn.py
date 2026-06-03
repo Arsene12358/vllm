@@ -257,6 +257,17 @@ class FlashAttentionMetadata:
     # Δ < 0 only once it nears the trained range — clamping the effective
     # query position at safe_bound. See build() for the rationale.
     mrope_delta_t: int = 0
+    # Option B Stage 1 (bounded positions): when True, the cascade suffix
+    # rotates recent K by a *per-token* Δ (mrope_delta_vec) to its bounded
+    # virtual slot, and the query is NOT rotated (the model already placed it
+    # at the bounded window front S+R). Mutually exclusive with
+    # use_sink_window_cascade_a. See build() / sink_window_cascade_attention().
+    use_sink_window_bounded: bool = False
+    # Per-token Δ for the materialised recent window under bounded positions:
+    #   Δ(p) = (S+R) − T − 0  for prefill-written tokens (true pos < prompt_len)
+    #          (i.e. S+R−T, uniform); p − T for decode-written tokens.
+    # Shape [recent_kv_len]; applied via _apply_rope_delta_mrope_pertoken.
+    mrope_delta_vec: torch.Tensor | None = None
 
     # For GQA DCP
     max_dcp_context_kv_len: int | None = None
@@ -658,6 +669,33 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 safe_bound = max_pos - sink_window_recent_size
                 mrope_delta_t = min(0, safe_bound - total_computed)
 
+        # Option B Stage 1: bounded positions. The decode query has been pinned
+        # by the model runner at the window front S+R, so the recent window
+        # must be re-rotated to its bounded virtual slots [S, S+R) with a
+        # per-token Δ. Virtual slot of a recent token at true pos p is
+        # v(p) = S + R − T + p; its write position is p (prefill, p < L) or
+        # S+R (decode, p >= L), so Δ(p) = v(p) − write(p) = (S+R−T) or (p−T).
+        use_sink_window_bounded = (
+            sink_window_recent_size is not None
+            and self.cache_config.streaming_kv_bounded_positions
+        )
+        mrope_delta_vec = None
+        if use_sink_window_bounded and num_reqs >= 1:
+            assert self.cache_config.streaming_kv_start_size is not None
+            S = self.cache_config.streaming_kv_start_size
+            R = sink_window_recent_size
+            T = int(seq_lens[0].item())
+            recent_kv_len = int(suffix_kv_lens[0].item())
+            prompt_lens = common_attn_metadata.num_prompt_tokens
+            L = int(prompt_lens[0]) if prompt_lens is not None else T
+            p = torch.arange(
+                T - recent_kv_len, T, device=seq_lens.device, dtype=torch.float32
+            )
+            virtual = S + R - T + p
+            mrope_delta_vec = torch.where(
+                p < L, virtual - p, virtual - (S + R)
+            )  # [recent_kv_len]
+
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -676,6 +714,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             suffix_kv_lens=suffix_kv_lens,
             use_sink_window_cascade_a=use_sink_window_cascade_a,
             mrope_delta_t=mrope_delta_t,
+            use_sink_window_bounded=use_sink_window_bounded,
+            mrope_delta_vec=mrope_delta_vec,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
@@ -927,7 +967,10 @@ class FlashAttentionImpl(AttentionImpl):
 
         # Cascade attention (rare case). Phase 2b option (a) takes the
         # materialise-and-passthrough variant when the feature flag is set.
-        if attn_metadata.use_sink_window_cascade_a:
+        if (
+            attn_metadata.use_sink_window_cascade_a
+            or attn_metadata.use_sink_window_bounded
+        ):
             sink_window_cascade_attention(
                 output[:num_actual_tokens],
                 query[:num_actual_tokens],
@@ -948,6 +991,8 @@ class FlashAttentionImpl(AttentionImpl):
                 max_num_splits=attn_metadata.max_num_splits,
                 fa_version=self.vllm_flash_attn_version,
                 mrope_delta_t=attn_metadata.mrope_delta_t,
+                bounded=attn_metadata.use_sink_window_bounded,
+                mrope_delta_vec=attn_metadata.mrope_delta_vec,
                 prefix_scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
                 q_descale=layer._q_scale,
                 k_descale=layer._k_scale,
@@ -1570,6 +1615,8 @@ def sink_window_cascade_attention(
     max_num_splits: int,
     fa_version: int,
     mrope_delta_t: int = 0,
+    bounded: bool = False,
+    mrope_delta_vec: torch.Tensor | None = None,
     prefix_scheduler_metadata: torch.Tensor | None = None,
     q_descale: torch.Tensor | None = None,
     k_descale: torch.Tensor | None = None,
@@ -1623,7 +1670,9 @@ def sink_window_cascade_attention(
     # Reshape Q to [N, num_heads * head_dim] -> [N, num_heads, head_dim] for
     # rotation, then back. The query passed in has shape
     # [num_tokens, num_q_heads, head_dim] already in the FA3 convention.
-    if mrope_delta_t != 0:
+    # Option (a) rotates Q by the scalar Δ. Option B Stage 1 (bounded) does NOT
+    # rotate Q — the model runner already placed it at the bounded front S+R.
+    if not bounded and mrope_delta_t != 0:
         query = _apply_rope_delta_mrope(
             query,
             delta_t=mrope_delta_t,
@@ -1684,7 +1733,15 @@ def sink_window_cascade_attention(
     # distance. For an in-window sequence Δ == 0 → no-op.
     # mrope_section hardcoded to Qwen3-Omni's [24, 20, 20]; plumb from
     # vllm_config when generalising.
-    if mrope_delta_t != 0:
+    if bounded:
+        # Option B Stage 1: each recent token needs a different Δ to reach its
+        # bounded virtual slot (prefill-written vs decode-written), so apply the
+        # per-token Δ vector computed in build().
+        if mrope_delta_vec is not None:
+            recent_k = _apply_rope_delta_mrope_pertoken(
+                recent_k, mrope_delta_vec[:recent_kv_len]
+            )
+    elif mrope_delta_t != 0:
         recent_k = _apply_rope_delta_mrope(
             recent_k,
             delta_t=mrope_delta_t,

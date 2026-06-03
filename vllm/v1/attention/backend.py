@@ -402,6 +402,11 @@ class CommonAttentionMetadata:
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 
+    num_prompt_tokens: np.ndarray | None = None
+    """(num_reqs,) per-request prompt length. Set by the GPU model runner.
+    Used by the SinkWindow bounded-positions path to tell prefill-written
+    recent tokens (true pos < prompt_len) from decode-written ones."""
+
     seq_lens_cpu_upper_bound: torch.Tensor | None = None
     """(batch_size,) CPU upper bound on seq_lens. Precise for prefill rows
     and for all rows outside async spec decode; optimistic for async-spec
