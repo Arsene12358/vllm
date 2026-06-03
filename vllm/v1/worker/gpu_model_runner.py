@@ -2550,38 +2550,43 @@ class GPUModelRunner(
                 dst_start = mrope_pos_ptr
                 dst_end = mrope_pos_ptr + completion_part_len
 
+                assert req.mrope_position_delta is not None
+                MRotaryEmbedding.get_next_input_positions_tensor(
+                    out=self.mrope_positions.np,
+                    out_offset=dst_start,
+                    mrope_position_delta=req.mrope_position_delta,
+                    context_len=num_computed_tokens + prompt_part_len,
+                    num_new_tokens=completion_part_len,
+                )
                 cc = self.cache_config
                 if (
                     cc.streaming_kv_bounded_positions
-                    and cc.streaming_kv_start_size is not None
                     and cc.streaming_kv_recent_size is not None
                 ):
-                    # Option B Stage 1: pin every decode token's M-RoPE position
-                    # at the bounded window front (start + recent) on all three
-                    # axes, so the model rotary never indexes past start+recent
-                    # during decode (unbounded generation, bounded cos/sin). The
-                    # recent window is re-rotated to its virtual slots in the
+                    # Option B Stage 1: clamp the decode token's M-RoPE position
+                    # at safe_bound = max_position_embeddings - recent_size, so
+                    # the model rotary never indexes past safe_bound during
+                    # decode (cos/sin bounded -> unbounded generation). In-range
+                    # positions (< safe_bound) are left at their true value
+                    # (no distortion); only positions that would exceed the
+                    # trained range are clamped, keeping the decode->sink
+                    # relative distance large (sinks keep their attention-sink
+                    # role). The recent window is re-rotated to match in the
                     # attention backend (see sink_window_cascade_attention).
-                    front = (
-                        cc.streaming_kv_start_size + cc.streaming_kv_recent_size
+                    max_pos = getattr(
+                        self.model_config.hf_text_config,
+                        "max_position_embeddings",
+                        None,
                     )
-                    self.mrope_positions.np[:, dst_start:dst_end] = front
-                    logger.info_once(
-                        "[streaming-kv][bounded] decode M-RoPE positions pinned "
-                        "at front=%d (start=%d recent=%d)",
-                        front,
-                        cc.streaming_kv_start_size,
-                        cc.streaming_kv_recent_size,
-                    )
-                else:
-                    assert req.mrope_position_delta is not None
-                    MRotaryEmbedding.get_next_input_positions_tensor(
-                        out=self.mrope_positions.np,
-                        out_offset=dst_start,
-                        mrope_position_delta=req.mrope_position_delta,
-                        context_len=num_computed_tokens + prompt_part_len,
-                        num_new_tokens=completion_part_len,
-                    )
+                    if max_pos is not None:
+                        safe_bound = max_pos - cc.streaming_kv_recent_size
+                        arr = self.mrope_positions.np[:, dst_start:dst_end]
+                        np.minimum(arr, safe_bound, out=arr)
+                        logger.info_once(
+                            "[streaming-kv][bounded] decode M-RoPE positions "
+                            "clamped at safe_bound=%d",
+                            safe_bound,
+                        )
 
                 mrope_pos_ptr += completion_part_len
 

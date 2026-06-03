@@ -263,10 +263,11 @@ class FlashAttentionMetadata:
     # at the bounded window front S+R). Mutually exclusive with
     # use_sink_window_cascade_a. See build() / sink_window_cascade_attention().
     use_sink_window_bounded: bool = False
-    # Per-token Δ for the materialised recent window under bounded positions:
-    #   Δ(p) = (S+R) − T − 0  for prefill-written tokens (true pos < prompt_len)
-    #          (i.e. S+R−T, uniform); p − T for decode-written tokens.
-    # Shape [recent_kv_len]; applied via _apply_rope_delta_mrope_pertoken.
+    # Per-token Δ for the materialised recent window under bounded positions,
+    # gated on T > safe_bound (= max_pos − recent). Δ(p) = safe_bound − T for
+    # tokens written in-range, p − T for decode tokens clamped at safe_bound.
+    # None while in-range (no re-indexing). Shape [recent_kv_len]; applied via
+    # _apply_rope_delta_mrope_pertoken.
     mrope_delta_vec: torch.Tensor | None = None
 
     # For GQA DCP
@@ -669,32 +670,41 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 safe_bound = max_pos - sink_window_recent_size
                 mrope_delta_t = min(0, safe_bound - total_computed)
 
-        # Option B Stage 1: bounded positions. The decode query has been pinned
-        # by the model runner at the window front S+R, so the recent window
-        # must be re-rotated to its bounded virtual slots [S, S+R) with a
-        # per-token Δ. Virtual slot of a recent token at true pos p is
-        # v(p) = S + R − T + p; its write position is p (prefill, p < L) or
-        # S+R (decode, p >= L), so Δ(p) = v(p) − write(p) = (S+R−T) or (p−T).
+        # Option B Stage 1: bounded positions. The model runner clamps the
+        # decode query's M-RoPE position at safe_bound = max_pos − recent. Gate
+        # like option (a): only re-index once the decode position passes
+        # safe_bound (in-range → true positions, Δ=0, no distortion). Past it
+        # the recent window is re-rotated to virtual slots just below the
+        # clamped query: v(p) = safe_bound − T + p; write position is p
+        # (prefill, p < L) or min(p, safe_bound) (decode). Δ(p) = v(p) − write(p)
+        # = (safe_bound − T) for p written in-range, (p − T) for clamped decode
+        # tokens. Keeps decode→sink relative large (sinks stay sinks).
         use_sink_window_bounded = (
             sink_window_recent_size is not None
             and self.cache_config.streaming_kv_bounded_positions
         )
         mrope_delta_vec = None
         if use_sink_window_bounded and num_reqs >= 1:
-            assert self.cache_config.streaming_kv_start_size is not None
-            S = self.cache_config.streaming_kv_start_size
-            R = sink_window_recent_size
-            T = int(seq_lens[0].item())
-            recent_kv_len = int(suffix_kv_lens[0].item())
-            prompt_lens = common_attn_metadata.num_prompt_tokens
-            L = int(prompt_lens[0]) if prompt_lens is not None else T
-            p = torch.arange(
-                T - recent_kv_len, T, device=seq_lens.device, dtype=torch.float32
+            max_pos = getattr(
+                self.model_config.hf_text_config, "max_position_embeddings", None
             )
-            virtual = S + R - T + p
-            mrope_delta_vec = torch.where(
-                p < L, virtual - p, virtual - (S + R)
-            )  # [recent_kv_len]
+            T = int(seq_lens[0].item())
+            if max_pos is not None and T > (max_pos - sink_window_recent_size):
+                safe_bound = max_pos - sink_window_recent_size
+                recent_kv_len = int(suffix_kv_lens[0].item())
+                prompt_lens = common_attn_metadata.num_prompt_tokens
+                L = int(prompt_lens[0]) if prompt_lens is not None else T
+                p = torch.arange(
+                    T - recent_kv_len, T, device=seq_lens.device,
+                    dtype=torch.float32,
+                )
+                # write position: prefill tokens at true p; decode tokens (p>=L)
+                # were written clamped at min(p, safe_bound).
+                write_pos = torch.where(
+                    p < L, p, torch.clamp(p, max=float(safe_bound))
+                )
+                virtual = safe_bound - T + p
+                mrope_delta_vec = virtual - write_pos  # [recent_kv_len]
 
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
