@@ -684,13 +684,22 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             and self.cache_config.streaming_kv_bounded_positions
         )
         mrope_delta_vec = None
-        if use_sink_window_bounded and num_reqs >= 1:
+        # DECODE-ONLY: only re-rotate recent-K when the query is actually
+        # clamped, i.e. on decode steps (max_query_len == 1). During chunked
+        # prefill the prompt's query tokens keep their TRUE positions (the
+        # decode-position clamp lives in the completion branch only), so
+        # re-rotating recent-K there would mismatch the unclamped prefill
+        # queries and corrupt prefill attention (seen at >65k where the prompt
+        # is chunked and T crosses safe_bound mid-prefill).
+        if use_sink_window_bounded and num_reqs >= 1 and max_query_len == 1:
             max_pos = getattr(
                 self.model_config.hf_text_config, "max_position_embeddings", None
             )
             T = int(seq_lens[0].item())
-            if max_pos is not None and T > (max_pos - sink_window_recent_size):
-                safe_bound = max_pos - sink_window_recent_size
+            safe_bound = (
+                max_pos - sink_window_recent_size if max_pos is not None else None
+            )
+            if safe_bound is not None and T > safe_bound:
                 recent_kv_len = int(suffix_kv_lens[0].item())
                 prompt_lens = common_attn_metadata.num_prompt_tokens
                 L = int(prompt_lens[0]) if prompt_lens is not None else T
@@ -703,7 +712,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 write_pos = torch.where(
                     p < L, p, torch.clamp(p, max=float(safe_bound))
                 )
-                virtual = safe_bound - T + p
+                # T = seq_lens[0] INCLUDES the query, so the query's true
+                # position is (T - 1). The recent window's virtual slots are
+                # measured relative to the (clamped) query, so they must use
+                # (T - 1). Using T put the window one position too far —
+                # relative distance = true + 1 — which is a 100% error for the
+                # closest recent token (1 -> 2) and caused the repetition loop.
+                q_true = T - 1
+                virtual = safe_bound - q_true + p
                 mrope_delta_vec = virtual - write_pos  # [recent_kv_len]
 
         attn_metadata = FlashAttentionMetadata(
