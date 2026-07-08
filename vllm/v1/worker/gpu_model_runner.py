@@ -2542,6 +2542,26 @@ class GPUModelRunner(
                 self.mrope_positions.cpu[:, dst_start:dst_end] = req.mrope_positions[
                     :, src_start:src_end
                 ]
+                # [exp-pos] position-growth probe: log cumulative max M-RoPE
+                # position vs token count, throttled to once per 2000-position
+                # crossing (~33 lines to the 65536 trained-range wall). Debug
+                # instrument for the persistent-video experiment; remove later.
+                _mp = int(req.mrope_positions[:, :src_end].max())
+                # Throttle per (request, 1000-position bucket) so a fresh
+                # request (a refresh epoch) re-logs from low positions —
+                # makes the position RESET at each refresh visible.
+                _bk = _mp // 1000
+                _buckets = getattr(self, "_exp_pos_buckets", None)
+                if _buckets is None:
+                    _buckets = self._exp_pos_buckets = {}
+                if _bk > _buckets.get(req_id, -1):
+                    _buckets[req_id] = _bk
+                    logger.info(
+                        "[exp-pos] req=%s computed_tok=%d max_mrope_pos=%d",
+                        req_id,
+                        num_computed_tokens + prompt_part_len,
+                        _mp,
+                    )
                 mrope_pos_ptr += prompt_part_len
 
             if completion_part_len > 0:
