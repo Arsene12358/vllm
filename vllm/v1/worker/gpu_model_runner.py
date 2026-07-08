@@ -2421,24 +2421,15 @@ class GPUModelRunner(
             int: Length of common prefix in tokens.
         """
 
-        # Phase 2a: SinkWindowSpec forces cascade attention with a pinned
-        # sink prefix of `start_size` tokens, regardless of the scheduler's
-        # prefix-caching common-prefix detection (which is disabled for
-        # SinkWindow groups in Phase 1's SinkWindowManager.find_longest_cache_hit).
-        # The assumption is batch_size == 1 (single continuous stream).
+        # SinkWindowSpec no longer uses cascade attention. The FA metadata
+        # builder splices the evicted null run out of each request's block
+        # table and issues ONE causal varlen call over the compacted row
+        # (see FlashAttentionMetadataBuilder.build). This is numerically
+        # identical to the former prefix+suffix+merge cascade, cheaper at
+        # decode shapes, and — unlike the cascade, whose common-prefix
+        # concept is batch-global — works for batch_size > 1.
         if isinstance(kv_cache_spec, SinkWindowSpec):
-            assert len(num_computed_tokens) == 1, (
-                "SinkWindowSpec cascade attention assumes batch_size == 1 "
-                f"(single continuous stream); got {len(num_computed_tokens)} reqs."
-            )
-            # Need at least one token after the pinned sink prefix to make
-            # the suffix pass non-empty.
-            if num_computed_tokens[0] <= kv_cache_spec.start_size:
-                return 0
-            start_size = kv_cache_spec.start_size
-            block_size = kv_cache_spec.block_size
-            sink_blocks = cdiv(start_size, block_size)
-            return sink_blocks * block_size
+            return 0
 
         common_prefix_len = num_common_prefix_blocks * kv_cache_spec.block_size
         if common_prefix_len == 0:
