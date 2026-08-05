@@ -1319,6 +1319,13 @@ class Scheduler(SchedulerInterface):
         session.num_prompt_tokens = len(session.prompt_token_ids)
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
+        # Apply the per-chunk generation budget. StreamingUpdate carries
+        # max_tokens but the cached Request.max_tokens (read by check_stop)
+        # was never refreshed, so every turn kept the FIRST chunk's value.
+        # Without this, a session can't vary max_tokens per chunk (e.g.
+        # input-only frame appends at max_tokens=1 then a query that
+        # generates a full answer) — see Request.__init__ / utils.check_stop.
+        session.max_tokens = update.max_tokens
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
