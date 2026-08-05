@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -25,12 +26,15 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     RSWASpec,
     SinkFullAttentionSpec,
+    SinkWindowSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -1066,6 +1070,108 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return 0
 
 
+class SinkWindowManager(SlidingWindowManager):
+    """KV cache manager for SinkWindowSpec (StreamingLLM-style attention).
+
+    Pins the first `start_size` tokens (rounded up to whole blocks) so eviction
+    only targets the middle — between the pinned sink prefix and the rolling
+    recent-window tail. Post-eviction layout: [sink_blocks ..., NULL ..., recent].
+    Prefix caching is disabled for SinkWindow groups (discontiguous layout breaks
+    the contiguous-prefix matcher); re-prefilling on cache miss is acceptable.
+    """
+
+    def __init__(self, kv_cache_spec: SinkWindowSpec, **kwargs) -> None:
+        super().__init__(kv_cache_spec, **kwargs)
+        self.start_size = kv_cache_spec.start_size
+        # cdiv so a partial last sink block still counts as pinned.
+        self.start_block_count = cdiv(self.start_size, self.block_size)
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: KVCacheSpec,
+        drop_eagle_block: bool,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        # See class docstring: disable prefix caching for Phase 1.
+        assert isinstance(kv_cache_spec, SinkWindowSpec), (
+            "SinkWindowManager can only be used for sink+window groups"
+        )
+        return tuple([] for _ in kv_cache_group_ids), 0
+
+    @classmethod
+    def reachable_block_mask(
+        cls,
+        start_block: int,
+        end_block: int,
+        alignment_tokens: int | None,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        retention_interval: int | None = None,
+        reachable_boundaries: Sequence[int] = (),
+    ) -> list[bool] | None:
+        # `find_longest_cache_hit` above never returns a hit, so no block can
+        # ever serve one: keep them all out of the prefix-cache hash map. (The
+        # inherited SWA mask would also assert on a non-SlidingWindowSpec.)
+        assert isinstance(kv_cache_spec, SinkWindowSpec)
+        return [False] * (end_block - start_block)
+
+    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+        # Tell the base eviction NOT to touch our request's blocks — we do
+        # pinned-aware eviction ourselves in `remove_skipped_blocks` so the
+        # base's blind "free everything up to N" loop would corrupt the sinks.
+        # (v0.26.0 also consumes this in allocation accounting: 0 keeps the
+        # sink prefix real — never null-padded or skip-discounted.)
+        return 0
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        processed_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        # Same as SlidingWindowManager's pre-v0.26 eviction but stops at
+        # `start_block_count` so the pinned sink prefix is never freed.
+        del num_prompt_tokens
+        last_useful_token = processed_computed_tokens - self.sliding_window + 1
+        last_useful_block = last_useful_token // self.block_size
+        blocks = self.req_to_blocks[request_id]
+        # Like the base, cap to the blocks that currently exist (the window
+        # may reach into the external-computed-tokens range before blocks are
+        # allocated for it).
+        last_useful_block = min(last_useful_block, len(blocks))
+        if last_useful_block <= self.start_block_count:
+            # Either the window hasn't grown past the sink budget yet,
+            # or there's nothing between sinks and the recent window.
+            return
+        if blocks[last_useful_block - 1] == self._null_block:
+            return
+        alive_before = sum(1 for b in blocks if b != self._null_block)
+        # The helper walks [start_block_count .. last_useful_block - 1]
+        # backward and stops at the first null, so the pinned
+        # [0 .. start_block_count) prefix is never touched.
+        self._remove_blocks_in_range(
+            request_id, self.start_block_count, last_useful_block
+        )
+        alive_blocks = sum(1 for b in blocks if b != self._null_block)
+        logger.info(
+            "[streaming-kv] eviction req=%s computed=%d total_blocks=%d "
+            "alive=%d (start_pinned=%d) freed=%d",
+            request_id,
+            processed_computed_tokens,
+            len(blocks),
+            alive_blocks,
+            self.start_block_count,
+            alive_before - alive_blocks,
+        )
+
+
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
     def __init__(self, kv_cache_spec: ChunkedLocalAttentionSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
@@ -1798,15 +1904,15 @@ def get_manager_for_kv_cache_spec(
     assert manager_class is not None, (
         f"No manager registered for KVCacheSpec {type(kv_cache_spec)}"
     )
-    # SlidingWindow / ChunkedLocalAttention managers recycle blocks;
-    # the runtime admission cap must match the recycling-aware bound the
-    # startup pool sizer uses (single source of truth: the spec method).
+    # SlidingWindow / SinkWindow / ChunkedLocalAttention managers recycle
+    # blocks; the runtime admission cap must match the recycling-aware bound
+    # the startup pool sizer uses (single source of truth: the spec method).
     # R-SWA also recycles gap blocks but peak physical KV still fits the
     # full-attention bound (prefix + window <= max_model_len), so it inherits
     # FullAttentionSpec sizing without a separate admission cap.
     if isinstance(
         kv_cache_spec,
-        (SlidingWindowSpec, ChunkedLocalAttentionSpec),
+        (SlidingWindowSpec, ChunkedLocalAttentionSpec, SinkWindowSpec),
     ):
         kwargs["max_admission_blocks_per_request"] = (
             kv_cache_spec.max_admission_blocks_per_request(
@@ -1835,6 +1941,11 @@ def register_all_kvcache_specs(vllm_config):
         SlidingWindowMLASpec,
         SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
+    )
+    KVCacheSpecRegistry.register(
+        SinkWindowSpec,
+        SinkWindowManager,
+        uniform_type_base_spec=SinkWindowSpec,
     )
 
     KVCacheSpecRegistry.register(
