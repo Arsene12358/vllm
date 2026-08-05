@@ -57,7 +57,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, SinkWindowSpec
 from vllm.v1.worker.cp_utils import (
     run_split_fa2_dcp_context_attention,
     should_skip_dcp_context_attention,
@@ -319,6 +319,57 @@ def _maybe_symmetrize_window(
     return window
 
 
+def compute_sinkwindow_rows(
+    block_table_tensor: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    num_reqs: int,
+    block_size: int,
+    start_size: int,
+    recent_size: int,
+    dst: torch.Tensor,
+) -> list[int]:
+    """Rebuild each request's row as ``[sink_blocks ++ recent_TAIL_blocks]``.
+
+    ``SinkWindowManager`` evicts middle blocks but leaves the logical block
+    table length intact, so the raw row contains a run of null block ids that
+    the kernel must not read. This writes the compacted row into ``dst`` and
+    returns the capped alive-token counts. Tail anchoring (not front-reading
+    after the sinks) is required so decode always sees its own newest tokens.
+
+    The capped formula degenerates to ``total_kv`` for requests that have not
+    evicted yet (``tail_start == sink_blocks``), so callers can apply it
+    unconditionally.
+
+    Args:
+        block_table_tensor: Raw runner block table, ``(>=num_reqs, max_blocks)``.
+        seq_lens_cpu: CPU tensor of logical KV lengths, one entry per request.
+        num_reqs: Number of rows to rebuild.
+        block_size: KV cache block size, in tokens.
+        start_size: Number of pinned sink tokens at the prefix.
+        recent_size: Length of the recent (tail) window, in tokens.
+        dst: Destination block table, written in place.
+
+    Returns:
+        Per-request sequence lengths in compacted-row coordinates.
+    """
+    sink_blocks = cdiv(start_size, block_size)
+    recent_blocks = recent_size // block_size
+    seq_lens_np = seq_lens_cpu[:num_reqs].numpy()
+    capped = [0] * num_reqs
+    for r in range(num_reqs):
+        total_kv = int(seq_lens_np[r])
+        nvb = cdiv(total_kv, block_size)
+        tail_start = max(sink_blocks, nvb - recent_blocks)
+        n_tail = max(0, nvb - tail_start)
+        dst[r, :sink_blocks] = block_table_tensor[r, :sink_blocks]
+        if n_tail > 0:
+            dst[r, sink_blocks : sink_blocks + n_tail] = block_table_tensor[
+                r, tail_start:nvb
+            ]
+        capped[r] = sink_blocks * block_size + (total_kv - tail_start * block_size)
+    return capped
+
+
 class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetadata]):
     # FA3:
     # Supports full cudagraphs for all cases.
@@ -444,6 +495,31 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 [self.rswa_window], dtype=torch.int32, device=self.device
             )
 
+        # StreamingLLM SinkWindow: single-pass compacted-row support.
+        # Compacted block-table rows and capped seq_lens are rebuilt on every
+        # build() into these persistent buffers, so the emitted metadata is
+        # full-cudagraph safe (captured tensor identities stay stable and only
+        # the contents change between replays).
+        if isinstance(kv_cache_spec, SinkWindowSpec):
+            # The cached-metadata fast path (gpu_model_runner) swaps in the RAW
+            # runner block table via update_block_table() without re-running
+            # build(); that would bypass the compaction and read evicted
+            # blocks. Force full builds.
+            self.supports_update_block_table = False
+            max_row_reqs = max(
+                vllm_config.scheduler_config.max_num_seqs,
+                self.max_cudagraph_size or 0,
+            )
+            max_row_blocks = cdiv(
+                vllm_config.model_config.max_model_len, kv_cache_spec.block_size
+            )
+            self._sinkwin_block_table = torch.zeros(
+                (max_row_reqs, max_row_blocks), dtype=torch.int32, device=self.device
+            )
+            self._sinkwin_seq_lens = torch.zeros(
+                max_row_reqs, dtype=torch.int32, device=self.device
+            )
+
     def build(
         self,
         common_prefix_len: int,
@@ -541,6 +617,47 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         prefix_kv_lens = None
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
+
+        # StreamingLLM SinkWindow: single-pass compacted-row read.
+        # The KV manager leaves the logical block table intact after evicting
+        # middle blocks. Rebuild each request's row as
+        #   [sink_blocks ++ recent_TAIL_blocks]
+        # and cap seq_lens to the alive token count, then let the ORDINARY
+        # (non-cascade) causal path below schedule one varlen call over it.
+        # Masking is index-based and RoPE is baked into K at cache-write time,
+        # so this is numerically identical to a prefix+suffix+merge cascade at
+        # bf16 rounding, for any batch size.
+        if isinstance(self.kv_cache_spec, SinkWindowSpec):
+            assert causal is True, (
+                "SinkWindowSpec requires plain causal attention; the compacted "
+                "row is only valid for a causal single-pass read."
+            )
+            assert common_prefix_len == 0, (
+                "SinkWindowSpec must not route through cascade attention "
+                "(runner should return prefix_len 0)."
+            )
+            capped = compute_sinkwindow_rows(
+                block_table_tensor,
+                common_attn_metadata.seq_lens_cpu,
+                num_reqs,
+                self.block_size,
+                self.kv_cache_spec.start_size,
+                self.kv_cache_spec.sliding_window,
+                self._sinkwin_block_table,
+            )
+            self._sinkwin_seq_lens[:num_reqs].copy_(
+                torch.tensor(capped, dtype=torch.int32), non_blocking=True
+            )
+            seq_lens = self._sinkwin_seq_lens[:num_reqs]
+            block_table_tensor = self._sinkwin_block_table[:num_reqs]
+            max_seq_len = max(capped) if capped else max_seq_len
+            logger.info_once(
+                "[streaming-kv] single-pass compacted attention engaged "
+                "(start_size=%d recent_size=%d num_reqs=%d)",
+                self.kv_cache_spec.start_size,
+                self.kv_cache_spec.sliding_window,
+                num_reqs,
+            )
 
         if self.dcp_world_size > 1:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
@@ -653,6 +770,12 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         # Symmetrize the spec's sliding_window for non-causal attention
         group_sliding_window = getattr(self.kv_cache_spec, "sliding_window", None)
+        if isinstance(self.kv_cache_spec, SinkWindowSpec):
+            # SinkWindowSpec.sliding_window is the recent-window length used to
+            # build the compacted row above, not a kernel mask: the sinks sit
+            # at the front of that row and an FA window would mask them out.
+            # Compaction alone defines what is visible.
+            group_sliding_window = None
         base_window = (
             (-1, -1) if group_sliding_window is None else (group_sliding_window - 1, 0)
         )

@@ -163,6 +163,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpecKind,
     KVQuantMode,
     MambaSpec,
+    SinkWindowSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
@@ -2650,6 +2651,14 @@ class GPUModelRunner(
         Returns:
             int: Length of common prefix in tokens.
         """
+
+        # SinkWindowSpec does not use cascade attention. The FA metadata
+        # builder splices the evicted null run out of each request's block
+        # table and issues ONE causal varlen call over the compacted row
+        # (see FlashAttentionMetadataBuilder.build). Works for any batch size
+        # (cascade's common-prefix concept is batch-global).
+        if isinstance(kv_cache_spec, SinkWindowSpec):
+            return 0
 
         common_prefix_len = num_common_prefix_blocks * kv_cache_spec.block_size
         if common_prefix_len == 0:
