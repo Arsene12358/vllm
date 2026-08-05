@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SinkWindowSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -1440,6 +1441,17 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
         kv_cache_spec
     ) or UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec):
         return
+
+    if any(isinstance(spec, SinkWindowSpec) for spec in kv_cache_spec.values()):
+        raise ValueError(
+            "--streaming-kv-start-size/--streaming-kv-recent-size produced "
+            "SinkWindowSpec for some layers, but this hybrid model requires "
+            "unifying KV cache specs because the hybrid KV cache manager is "
+            "disabled. SinkWindowSpec must not be down-converted to full "
+            "attention (that would silently disable StreamingLLM-style "
+            "eviction). Enable the hybrid KV cache manager or unset the "
+            "streaming-kv flags."
+        )
 
     logger.warning(
         "Hybrid KV cache manager is disabled for this hybrid model, "

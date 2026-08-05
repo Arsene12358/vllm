@@ -90,6 +90,16 @@ class CacheConfig:
     sliding_window: int | None = None
     """Sliding window size for the KV cache. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
+    streaming_kv_start_size: int | None = None
+    """StreamingLLM-style sink prefix size: number of leading tokens whose
+    KV entries are never evicted. When set together with
+    `streaming_kv_recent_size`, every decoder attention layer's KV cache
+    spec becomes `SinkWindowSpec` instead of the model-default
+    `FullAttentionSpec` / `SlidingWindowSpec`. Both must be set together;
+    setting only one is an error."""
+    streaming_kv_recent_size: int | None = None
+    """StreamingLLM-style recent-window size: number of most-recent tokens
+    whose KV entries are kept. See `streaming_kv_start_size`."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
@@ -290,3 +300,34 @@ class CacheConfig:
                 str(cache_dtype),
             )
         return cache_dtype
+
+    @model_validator(mode="after")
+    def _validate_streaming_kv(self) -> "CacheConfig":
+        # streaming_kv_* fields must be set together; both > 0 if set.
+        have_start = self.streaming_kv_start_size is not None
+        have_recent = self.streaming_kv_recent_size is not None
+        if have_start != have_recent:
+            raise ValueError(
+                "streaming_kv_start_size and streaming_kv_recent_size must be "
+                "set together (got start="
+                f"{self.streaming_kv_start_size}, recent="
+                f"{self.streaming_kv_recent_size})."
+            )
+        if have_start:
+            if (
+                self.streaming_kv_start_size is not None
+                and self.streaming_kv_start_size <= 0
+            ):
+                raise ValueError(
+                    f"streaming_kv_start_size must be > 0, got "
+                    f"{self.streaming_kv_start_size}"
+                )
+            if (
+                self.streaming_kv_recent_size is not None
+                and self.streaming_kv_recent_size <= 0
+            ):
+                raise ValueError(
+                    f"streaming_kv_recent_size must be > 0, got "
+                    f"{self.streaming_kv_recent_size}"
+                )
+        return self

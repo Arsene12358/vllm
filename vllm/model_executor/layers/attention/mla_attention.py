@@ -1073,6 +1073,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        # MLA layers bypass Attention.get_kv_cache_spec, so reject the
+        # streaming-kv flags here instead of silently ignoring them.
+        assert vllm_config.cache_config.streaming_kv_start_size is None, (
+            "MLA is not supported for sink+window (StreamingLLM-style) attention."
+        )
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
