@@ -686,6 +686,79 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class SinkWindowSpec(AttentionSpec):
+    """StreamingLLM-style attention: pin the first `start_size` tokens and the
+    last `sliding_window` tokens; the middle is evictable.
+
+    Used by `SinkWindowManager` (see single_type_kv_cache_manager.py). All
+    layers in a SinkWindow KV cache group must share the same start_size
+    and sliding_window — enforced by the base `KVCacheSpec.merge` via
+    frozen-dataclass equality.
+
+    KV management evicts middle blocks; the FA metadata builder issues one
+    causal varlen call over a compacted [sink ++ recent-tail] row.
+    """
+
+    sliding_window: int  # recent_size, the tail window length
+    start_size: int  # number of pinned sink tokens at the prefix
+
+    def __post_init__(self) -> None:
+        if self.start_size <= 0:
+            raise ValueError(
+                f"SinkWindowSpec.start_size must be > 0, got {self.start_size}"
+            )
+        if self.sliding_window <= 0:
+            raise ValueError(
+                f"SinkWindowSpec.sliding_window must be > 0, got {self.sliding_window}"
+            )
+
+    def max_admission_blocks_per_request(
+        self, max_in_flight_tokens: int, max_model_len: int
+    ) -> int:
+        """Per-request admission cap, in blocks.
+
+        Single source of truth for both startup pool sizing
+        (`max_memory_usage_bytes`) and the runtime admission gate, same as
+        `SlidingWindowSpec.max_admission_blocks_per_request`.
+
+        `max_in_flight_tokens` is the max tokens scheduled but not yet settled
+        (one batch per concurrent step); see `VllmConfig.max_in_flight_tokens`.
+        """
+        # Per-request live KV: pinned start_size tokens + (sliding_window - 1)
+        # most-recent tokens + the in-flight tokens. Capped at max_model_len.
+        num_tokens = min(
+            self.start_size + self.sliding_window - 1 + max_in_flight_tokens,
+            max_model_len,
+        )
+        # +1 because the recent window may not be block-aligned (same reason
+        # as SlidingWindowSpec).
+        return cdiv(num_tokens, self.block_size) + 1
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
+            "DCP not supported for sink+window attention."
+        )
+        assert vllm_config.parallel_config.prefill_context_parallel_size == 1, (
+            "PCP not supported for sink+window attention."
+        )
+        max_blocks = self.max_admission_blocks_per_request(
+            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+            max_model_len=vllm_config.model_config.max_model_len,
+        )
+        return max_blocks * self.page_size_bytes
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, SinkWindowSpec)
+            and spec.sliding_window == self.sliding_window
+            and spec.start_size == self.start_size
+            for spec in kv_cache_specs.values()
+        )
+
+
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
