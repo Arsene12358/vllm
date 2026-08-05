@@ -20,6 +20,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
     compute_sinkwindow_rows,
+    sinkwindow_max_seq_len,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SinkWindowSpec
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -77,6 +78,18 @@ def test_capped_len_matches_written_blocks():
         n_written = sink_blocks + max(0, nvb - tail_start)
         assert 0 < capped[0] <= n_written * bs, (total_kv, capped, n_written)
         assert capped[0] <= total_kv
+        # ...and never above the batch-independent bound used for max_seq_len.
+        assert capped[0] <= sinkwindow_max_seq_len(bs, start, recent)
+
+
+def test_recent_window_below_block_size_is_rejected():
+    """recent_size // block_size floors to 0, which would delete the whole
+    recent tail and leave decode attending to a truncated prefix."""
+    bs, start, recent = 16, 32, 8
+    raw = torch.arange(1, 33, dtype=torch.int32).reshape(1, 32)
+    dst = torch.zeros_like(raw)
+    with pytest.raises(AssertionError, match="block size"):
+        compute_sinkwindow_rows(raw, torch.tensor([300]), 1, bs, start, recent, dst)
 
 
 def test_multi_request_rows_are_independent():
@@ -144,7 +157,9 @@ def _make_sinkwindow_builder():
     )
 
 
-def _make_common_metadata(seq_lens: list[int], block_table: torch.Tensor):
+def _make_common_metadata(
+    seq_lens: list[int], block_table: torch.Tensor, max_seq_len: int | None = None
+):
     num_reqs = len(seq_lens)
     seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32)
     return CommonAttentionMetadata(
@@ -155,7 +170,7 @@ def _make_common_metadata(seq_lens: list[int], block_table: torch.Tensor):
         num_reqs=num_reqs,
         num_actual_tokens=num_reqs,
         max_query_len=1,
-        max_seq_len=max(seq_lens),
+        max_seq_len=max_seq_len if max_seq_len is not None else max(seq_lens),
         block_table_tensor=block_table,
         slot_mapping=torch.zeros(num_reqs, dtype=torch.int64),
         causal=True,
@@ -186,7 +201,10 @@ def test_build_swaps_in_compacted_row_and_capped_lens():
     )
     assert md.block_table[0, :6].tolist() == [1, 2, 16, 17, 18, 19]
     assert md.seq_lens.tolist() == [92]
-    assert md.max_seq_len == 92
+    # max_seq_len is the batch-independent bound, not max(capped) — see
+    # test_cudagraph_capture_max_seq_len_is_not_below_replay.
+    assert md.max_seq_len == sinkwindow_max_seq_len(BLOCK_SIZE, START_SIZE, RECENT_SIZE)
+    assert md.max_seq_len >= 92
     # Ordinary causal varlen path, never cascade.
     assert md.use_cascade is False
     assert md.common_prefix_len == 0
@@ -224,6 +242,42 @@ def test_build_reuses_persistent_buffers():
     assert second.seq_lens.data_ptr() == first_sl_ptr
     assert second.seq_lens.tolist() == [93]
     assert builder._sinkwin_block_table.shape == (MAX_NUM_SEQS, MAX_MODEL_LEN // 16)
+
+
+def test_cudagraph_capture_max_seq_len_is_not_below_replay():
+    """max_seq_len is baked into a captured full CUDA graph. The runner
+    inflates it to max_model_len for capture (gpu_model_runner: for_cudagraph
+    _capture -> max_seq_len = self.max_model_len) while filling the dummy
+    per-request lengths with max_query_len (1 for uniform decode). Deriving
+    max_seq_len from that batch would capture ~1 and truncate every replay."""
+    builder = _make_sinkwindow_builder()
+    raw = torch.arange(1, 65, dtype=torch.int32).reshape(2, 32)
+    capture = builder.build_for_cudagraph_capture(
+        _make_common_metadata([1, 1], raw, max_seq_len=MAX_MODEL_LEN)
+    )
+    replay = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=_make_common_metadata([300, 300], raw),
+    )
+    assert replay.seq_lens.tolist() == [92, 92]  # actual per-request lengths
+    assert capture.max_seq_len >= replay.max_seq_len
+    assert capture.max_seq_len >= max(replay.seq_lens.tolist())
+    # Batch-independent: identical scalar at capture and replay.
+    assert capture.max_seq_len == replay.max_seq_len
+    assert capture.max_seq_len == sinkwindow_max_seq_len(
+        BLOCK_SIZE, START_SIZE, RECENT_SIZE
+    )
+
+
+def test_build_rejects_mm_prefix_ranges():
+    """PrefixLM mm ranges are absolute token positions; the compacted row
+    re-indexes the KV, so the mask would land on the wrong keys."""
+    builder = _make_sinkwindow_builder()
+    raw = torch.arange(1, 33, dtype=torch.int32).reshape(1, 32)
+    cm = _make_common_metadata([300], raw)
+    cm.mm_req_doc_ranges = {0: [(10, 40)]}
+    with pytest.raises(AssertionError, match="streaming-kv"):
+        builder.build(common_prefix_len=0, common_attn_metadata=cm)
 
 
 def test_build_rejects_cascade_prefix():

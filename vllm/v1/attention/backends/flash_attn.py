@@ -354,6 +354,12 @@ def compute_sinkwindow_rows(
     """
     sink_blocks = cdiv(start_size, block_size)
     recent_blocks = recent_size // block_size
+    assert recent_blocks > 0, (
+        f"SinkWindow recent window ({recent_size} tokens) is smaller than the "
+        f"KV cache block size ({block_size}); it would round down to zero tail "
+        "blocks and decode would see only the sink prefix. Set "
+        "--streaming-kv-recent-size to at least the block size."
+    )
     seq_lens_np = seq_lens_cpu[:num_reqs].numpy()
     capped = [0] * num_reqs
     for r in range(num_reqs):
@@ -368,6 +374,28 @@ def compute_sinkwindow_rows(
             ]
         capped[r] = sink_blocks * block_size + (total_kv - tail_start * block_size)
     return capped
+
+
+def sinkwindow_max_seq_len(block_size: int, start_size: int, recent_size: int) -> int:
+    """Upper bound on any compacted row length, independent of the batch.
+
+    ``compute_sinkwindow_rows`` never returns a value above this: with
+    ``tail_start == sink_blocks`` the row is the whole (not yet evicted)
+    sequence, which by definition of that branch spans at most
+    ``sink_blocks + recent_blocks`` blocks; with
+    ``tail_start == nvb - recent_blocks`` the row is exactly
+    ``sink_blocks * block_size + total_kv - tail_start * block_size <=
+    (sink_blocks + recent_blocks) * block_size``.
+
+    ``max_seq_len`` must not be derived from the current batch: the runner
+    deliberately inflates it to ``max_model_len`` during CUDA graph capture
+    while feeding dummy per-request lengths of 1, and the scalar is baked into
+    the captured graph (``get_scheduler_metadata(max_seqlen_k=...)`` and
+    ``flash_attn_varlen_func(max_seqlen_k=...)``). A batch-derived value would
+    capture ~1 and silently truncate every replay. This bound is identical at
+    capture and at replay.
+    """
+    return (cdiv(start_size, block_size) + recent_size // block_size) * block_size
 
 
 class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetadata]):
@@ -636,6 +664,12 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 "SinkWindowSpec must not route through cascade attention "
                 "(runner should return prefix_len 0)."
             )
+            assert common_attn_metadata.mm_req_doc_ranges is None, (
+                "PrefixLM multimodal ranges are absolute token positions, but "
+                "the compacted row re-indexes the KV, so the mm_prefix mask "
+                "would land on the wrong keys. --streaming-kv is not "
+                "compatible with mm-prefix (bidirectional multimodal) models."
+            )
             capped = compute_sinkwindow_rows(
                 block_table_tensor,
                 common_attn_metadata.seq_lens_cpu,
@@ -650,7 +684,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             )
             seq_lens = self._sinkwin_seq_lens[:num_reqs]
             block_table_tensor = self._sinkwin_block_table[:num_reqs]
-            max_seq_len = max(capped) if capped else max_seq_len
+            # Batch-independent bound, NOT max(capped): this scalar is baked
+            # into full CUDA graphs at capture time, when the runner feeds
+            # dummy seq_lens of 1. See sinkwindow_max_seq_len.
+            max_seq_len = sinkwindow_max_seq_len(
+                self.block_size,
+                self.kv_cache_spec.start_size,
+                self.kv_cache_spec.sliding_window,
+            )
             logger.info_once(
                 "[streaming-kv] single-pass compacted attention engaged "
                 "(start_size=%d recent_size=%d num_reqs=%d)",
