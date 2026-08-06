@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    SinkWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -277,6 +278,39 @@ class AttentionGroup:
     def get_metadata_builder(self, ubatch_id: int = 0) -> AttentionMetadataBuilder:
         assert len(self.metadata_builders) > ubatch_id
         return self.metadata_builders[ubatch_id]
+
+
+def verify_sink_window_metadata_builders(
+    attn_groups: Iterable["AttentionGroup"],
+) -> None:
+    """Check that every `SinkWindowSpec` group got a FlashAttention builder.
+
+    Only `FlashAttentionMetadataBuilder` splices the evicted middle blocks out
+    of the block-table row (see `compute_sinkwindow_rows`). Any other builder
+    hands the raw, null-holed row to its kernel and silently reads freed KV.
+
+    Args:
+        attn_groups: The attention groups whose builders were just created.
+
+    Raises:
+        ValueError: If a `SinkWindowSpec` group has a non-FlashAttention
+            metadata builder.
+    """
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadataBuilder
+
+    for attn_group in attn_groups:
+        if not isinstance(attn_group.kv_cache_spec, SinkWindowSpec):
+            continue
+        for builder in attn_group.metadata_builders:
+            if not isinstance(builder, FlashAttentionMetadataBuilder):
+                raise ValueError(
+                    "--streaming-kv-start-size/--streaming-kv-recent-size "
+                    "require the FLASH_ATTN attention backend, but layers "
+                    f"{attn_group.layer_names} resolved to "
+                    f"{type(builder).__name__}. Sink+window row compaction is "
+                    "implemented only in FlashAttentionMetadataBuilder. Unset "
+                    "VLLM_ATTENTION_BACKEND (or set it to FLASH_ATTN)."
+                )
 
 
 def select_common_block_size(

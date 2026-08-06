@@ -121,7 +121,7 @@ MAX_MODEL_LEN = 512
 MAX_NUM_SEQS = 8
 
 
-def _make_vllm_config():
+def _make_vllm_config(rswa_window=None):
     """Minimal mock VllmConfig with only the fields the FA builder touches,
     avoiding any model download / HF config inspection."""
     return SimpleNamespace(
@@ -130,7 +130,7 @@ def _make_vllm_config():
             get_num_kv_heads=lambda _pc: 2,
             get_head_size=lambda: 64,
             max_model_len=MAX_MODEL_LEN,
-            rswa_window=None,
+            rswa_window=rswa_window,
         ),
         parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1),
         cache_config=SimpleNamespace(cache_dtype="auto"),
@@ -143,7 +143,7 @@ def _make_vllm_config():
     )
 
 
-def _make_sinkwindow_builder():
+def _make_sinkwindow_builder(rswa_window=None):
     spec = SinkWindowSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=2,
@@ -153,7 +153,7 @@ def _make_sinkwindow_builder():
         start_size=START_SIZE,
     )
     return FlashAttentionMetadataBuilder(
-        spec, ["layer.0"], _make_vllm_config(), torch.device("cpu")
+        spec, ["layer.0"], _make_vllm_config(rswa_window), torch.device("cpu")
     )
 
 
@@ -278,6 +278,42 @@ def test_build_rejects_mm_prefix_ranges():
     cm.mm_req_doc_ranges = {0: [(10, 40)]}
     with pytest.raises(AssertionError, match="streaming-kv"):
         builder.build(common_prefix_len=0, common_attn_metadata=cm)
+
+
+def test_build_rejects_rswa_prefix_lens():
+    """R-SWA prefix lengths are absolute token positions; the compacted row
+    re-indexes the KV, so the globally-visible prefix mask would land on the
+    wrong keys."""
+    builder = _make_sinkwindow_builder(rswa_window=128)
+    raw = torch.arange(1, 33, dtype=torch.int32).reshape(1, 32)
+    cm = _make_common_metadata([300], raw)
+    cm.rswa_prefix_lens = torch.tensor([40], dtype=torch.int32)
+    with pytest.raises(AssertionError, match="R-SWA"):
+        builder.build(common_prefix_len=0, common_attn_metadata=cm)
+
+
+def test_build_rejects_rswa_model_even_without_prefix_lens():
+    """A model config carrying rswa_window means R-SWA masking can switch on
+    for any later batch, so reject it up front rather than per-batch."""
+    builder = _make_sinkwindow_builder(rswa_window=128)
+    raw = torch.arange(1, 33, dtype=torch.int32).reshape(1, 32)
+    with pytest.raises(AssertionError, match="R-SWA"):
+        builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=_make_common_metadata([300], raw),
+        )
+
+
+def test_rswa_guard_inert_on_validated_config():
+    """Non-R-SWA model, no per-batch prefix lens: the guard must not fire."""
+    builder = _make_sinkwindow_builder()
+    assert builder.rswa_window is None
+    raw = torch.arange(1, 33, dtype=torch.int32).reshape(1, 32)
+    cm = _make_common_metadata([300], raw)
+    assert cm.rswa_prefix_lens is None
+    md = builder.build(common_prefix_len=0, common_attn_metadata=cm)
+    assert md.rswa_prefix_lens is None
+    assert md.seq_lens.tolist() == [92]
 
 
 def test_build_rejects_cascade_prefix():

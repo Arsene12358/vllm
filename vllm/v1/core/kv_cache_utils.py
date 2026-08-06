@@ -13,7 +13,7 @@ from functools import partial
 from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 
 from vllm import envs
-from vllm.config import VllmConfig
+from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
@@ -1425,6 +1425,43 @@ def get_kv_cache_config_from_groups(
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
     )
+
+
+def verify_streaming_kv_specs_uniform(
+    kv_cache_spec: dict[str, KVCacheSpec], cache_config: CacheConfig
+) -> None:
+    """Check that --streaming-kv reached every decoder attention layer.
+
+    ``Attention.get_kv_cache_spec`` honours the streaming-kv flags, but model
+    classes that override ``get_kv_cache_spec`` themselves (e.g.
+    ``DeepseekV4Attention``) never consult them and keep their default spec.
+    The result would be a model where only some layers evict, which silently
+    changes accuracy instead of failing.
+
+    Args:
+        kv_cache_spec: The kv cache spec of each layer in the model.
+        cache_config: The cache config carrying the streaming-kv flags.
+
+    Raises:
+        ValueError: If the flags are set and some attention layer did not
+            produce a `SinkWindowSpec`.
+    """
+    if cache_config.streaming_kv_start_size is None:
+        return
+    offenders = sorted(
+        f"{name} ({type(spec).__name__})"
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, AttentionSpec) and not isinstance(spec, SinkWindowSpec)
+    )
+    if offenders:
+        raise ValueError(
+            "--streaming-kv-start-size/--streaming-kv-recent-size must apply "
+            "to every decoder attention layer, but these layers produced a "
+            "different KV cache spec (their model class overrides "
+            f"get_kv_cache_spec and ignores the flags): {', '.join(offenders)}. "
+            "Partial sink+window eviction is not supported; unset the "
+            "streaming-kv flags for this model."
+        )
 
 
 def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):

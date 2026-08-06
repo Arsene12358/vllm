@@ -641,6 +641,19 @@ class Attention(nn.Module, AttentionLayerBase):
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for sink+window (StreamingLLM-style) attention."
             )
+            # SinkWindowManager evicts middle blocks but leaves the logical
+            # block table length intact, so the raw row contains a run of null
+            # block ids. Only FlashAttentionMetadataBuilder splices that hole
+            # out (see compute_sinkwindow_rows); every other backend would read
+            # the evicted blocks and silently produce garbage.
+            backend_name = self.attn_backend.get_name()
+            assert backend_name == "FLASH_ATTN", (
+                "--streaming-kv-start-size/--streaming-kv-recent-size require "
+                f"the FLASH_ATTN attention backend, but layer {self.layer_name} "
+                f"resolved to {backend_name}. Sink+window row compaction is "
+                "implemented only in FlashAttentionMetadataBuilder. Unset "
+                "VLLM_ATTENTION_BACKEND (or set it to FLASH_ATTN)."
+            )
             logger.info(
                 "[streaming-kv] emitting SinkWindowSpec for layer %s "
                 "(start=%d recent=%d)",

@@ -2303,6 +2303,40 @@ class VllmConfig:
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_streaming_kv(self) -> "VllmConfig":
+        if self.cache_config.streaming_kv_start_size is None:
+            return self
+
+        # Draft/target KV bookkeeping is not aware of SinkWindowManager's
+        # pinned-prefix eviction: rejected draft tokens are rolled back against
+        # a logical block table whose middle blocks may already be freed, and
+        # the drafter runs its own attention backend without row compaction.
+        if self.speculative_config is not None:
+            raise ValueError(
+                "--streaming-kv-start-size/--streaming-kv-recent-size are not "
+                "supported with speculative decoding. Sink+window eviction "
+                "frees middle KV blocks that draft-token rollback assumes are "
+                "still resident. Please drop --speculative-config."
+            )
+
+        # KV connectors compute their transferable/reusable block counts from
+        # the logical block table, which SinkWindowManager leaves at full
+        # length after evicting middle blocks. The connector would over-commit
+        # blocks that no longer hold valid KV.
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance
+        ):
+            raise ValueError(
+                "--streaming-kv-start-size/--streaming-kv-recent-size are not "
+                "supported with KV connectors (PD disaggregation, KV cache "
+                "offload). Sink+window eviction leaves the logical block table "
+                "at full length, so connector block accounting over-commits "
+                "blocks whose KV was already freed."
+            )
+        return self
+
 
 _current_vllm_config: VllmConfig | None = None
 _current_prefix: str | None = None

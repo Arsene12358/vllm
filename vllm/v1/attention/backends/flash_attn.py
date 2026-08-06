@@ -670,6 +670,15 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 "would land on the wrong keys. --streaming-kv is not "
                 "compatible with mm-prefix (bidirectional multimodal) models."
             )
+            assert (
+                self.rswa_window is None
+                and common_attn_metadata.rswa_prefix_lens is None
+            ), (
+                "R-SWA prefix lengths are absolute token positions, but the "
+                "compacted row re-indexes the KV, so the globally-visible "
+                "prefix mask would land on the wrong keys. --streaming-kv is "
+                "not compatible with R-SWA (reference sliding window) models."
+            )
             capped = compute_sinkwindow_rows(
                 block_table_tensor,
                 common_attn_metadata.seq_lens_cpu,

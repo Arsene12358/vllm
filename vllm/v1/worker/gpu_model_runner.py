@@ -241,6 +241,7 @@ from .utils import (
     copy_kv_cache_blocks_inplace,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
+    verify_sink_window_metadata_builders,
 )
 
 if TYPE_CHECKING:
@@ -7078,6 +7079,7 @@ class GPUModelRunner(
                     if not self.parallel_config.use_ubatching
                     else self.parallel_config.num_ubatches,
                 )
+            verify_sink_window_metadata_builders(self.attn_groups[kv_cache_group_id])
         # Calculate reorder batch threshold (if needed)
         # Note (tdoublep): do this *after* constructing builders,
         # because some of them change the threshold at init time.
@@ -7732,6 +7734,8 @@ class GPUModelRunner(
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
+        from vllm.v1.core.kv_cache_utils import verify_streaming_kv_specs_uniform
+
         if has_ec_transfer() and not get_ec_transfer().is_consumer:
             return {}
         kv_cache_spec: dict[str, KVCacheSpec] = {}
@@ -7760,6 +7764,8 @@ class GPUModelRunner(
                         indexes = backend.indexes_kv_by_block_stride()
                     spec = replace(spec, indexes_kv_by_block_stride=indexes)
                 kv_cache_spec[layer_name] = spec
+
+        verify_streaming_kv_specs_uniform(kv_cache_spec, self.cache_config)
 
         return kv_cache_spec
 
