@@ -13,6 +13,10 @@ that drives it from the runner:
   * Seat A (``apply_rebase_offset``) — re-applying the persisted offset after
     ``_init_mrope_positions`` recomputes positions from scratch (without it
     the next streaming chunk silently reverts the rebase);
+  * ``clear_rebase_offset`` — dropping the offset when preemption frees the
+    rotated K it describes, plus the backstop that catches a stale one;
+  * the steady state between chunk appends, where part or all of the alive
+    window's positions are synthesised from ``mrope_position_delta``;
   * the fences — non-``SinkWindowSpec`` groups are excluded, and a stride-0
     (``expand``ed) position tensor raises BEFORE anything is mutated.
 
@@ -31,7 +35,9 @@ import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 from vllm.v1.attention.streaming_rebase import (
+    _alive_position_bounds,
     apply_rebase_offset,
+    clear_rebase_offset,
     maybe_rebase_request,
     rotate_kv_pages,
 )
@@ -134,20 +140,26 @@ def _video_positions(n: int = NUM_PROMPT) -> torch.Tensor:
     return pos
 
 
-def _make_req_state(positions: torch.Tensor | None = None) -> CachedRequestState:
+def _make_req_state(
+    positions: torch.Tensor | None = None,
+    *,
+    num_prompt: int = NUM_PROMPT,
+    position_delta: int = -42,
+    num_computed: int = NUM_COMPUTED,
+) -> CachedRequestState:
     if positions is None:
-        positions = _text_positions()
+        positions = _text_positions(num_prompt)
     return CachedRequestState(
         req_id="req0",
-        prompt_token_ids=[0] * NUM_PROMPT,
+        prompt_token_ids=[0] * num_prompt,
         mm_features=[],
         sampling_params=None,
         generator=None,
         block_ids=(list(BLOCK_IDS),),
-        num_computed_tokens=NUM_COMPUTED,
+        num_computed_tokens=num_computed,
         output_token_ids=[],
         mrope_positions=positions,
-        mrope_position_delta=-42,
+        mrope_position_delta=position_delta,
     )
 
 
@@ -332,6 +344,117 @@ def test_delta_is_measured_from_the_aligned_boundary_not_raw_start_size():
     assert delta == WINDOW_START - 32
     # ...and the sink pages (which hold compacted tokens 0..31) are intact.
     assert torch.equal(packed[0][SINK_IDS], before[SINK_IDS])
+
+
+def test_faster_than_one_position_per_token_fails_loudly():
+    """Documented failure mode: the O(1) trigger probe stands in the window
+    front for the whole window, which assumes positions advance by at most one
+    per token. A stream that advances faster under-triggers, and the post-event
+    guard turns that into an engine-fatal assert (state is already mutated —
+    fail-loud is the accepted posture) naming the cause and the knobs."""
+    _, key_caches = _make_key_caches(1, seed=16)
+    idx = torch.arange(NUM_PROMPT, dtype=torch.long)
+    req_state = _make_req_state(torch.stack([3 * idx, 3 * idx + 1, 3 * idx + 2]))
+
+    with (
+        _config_ctx(),
+        pytest.raises(AssertionError, match="MORE than one position per token"),
+    ):
+        _rebase(req_state, key_caches, rotary=_make_rope())
+
+
+# ----------------------------------------------------------------------------
+# Steady state: num_computed past the stored prompt tensor (the normal state
+# between chunk appends, where the tail positions are synthesised from the delta)
+# ----------------------------------------------------------------------------
+def test_rebase_with_window_straddling_the_stored_prompt():
+    """Window starts inside the stored tensor and runs past it: Δ comes from
+    the stored leg, the post-event bound from the synthesised decode leg."""
+    packed, key_caches = _make_key_caches(1, seed=12)
+    before = packed[0].clone()
+    # 270 stored prompt positions (t+i), decode tail 270..299 at delta + index.
+    req_state = _make_req_state(num_prompt=270, position_delta=2)
+    assert req_state.mrope_positions.shape[1] < NUM_COMPUTED
+
+    lo, hi = _alive_position_bounds(req_state, WINDOW_START, NUM_COMPUTED)
+    assert (lo, hi) == (WINDOW_START, 2 + NUM_COMPUTED - 1)  # both legs
+
+    with _config_ctx():
+        delta = _rebase(req_state, key_caches, rotary=_make_rope())
+
+    assert delta == WINDOW_START - ALIGNED_START  # 208, from the stored leg
+    assert req_state.mrope_rebase_offset == 208
+    assert req_state.mrope_position_delta == 2 - 208
+    assert not torch.equal(packed[0][TAIL_IDS[0]], before[TAIL_IDS[0]])
+
+
+def test_rebase_with_window_entirely_past_the_stored_prompt():
+    """Window lies wholly in the synthesised decode tail, so BOTH the trigger
+    probe and Δ come from `mrope_position_delta + index`."""
+    packed, key_caches = _make_key_caches(1, seed=13)
+    before = packed[0].clone()
+    req_state = _make_req_state(num_prompt=200, position_delta=2)
+    assert req_state.mrope_positions.shape[1] < WINDOW_START
+
+    assert _alive_position_bounds(req_state, WINDOW_START, NUM_COMPUTED) == (
+        2 + WINDOW_START,
+        2 + NUM_COMPUTED - 1,
+    )
+
+    with _config_ctx():
+        delta = _rebase(req_state, key_caches, rotary=_make_rope())
+
+    assert delta == 2 + WINDOW_START - ALIGNED_START  # 210, purely synthesised
+    assert req_state.mrope_rebase_offset == 210
+    assert req_state.mrope_position_delta == 2 - 210
+    assert not torch.equal(packed[0][TAIL_IDS[0]], before[TAIL_IDS[0]])
+
+
+# ----------------------------------------------------------------------------
+# Preemption: the offset must not outlive the rotated K it describes
+# ----------------------------------------------------------------------------
+def test_clear_rebase_offset_restores_raw_positions():
+    """`_update_states`' resumed-from-preemption branch state: blocks replaced,
+    num_computed_tokens back to 0, positions still holding raw - offset and no
+    recompute in sight. Clearing must leave exactly what a fresh re-prefill
+    from token 0 expects."""
+    raw = _text_positions()
+    raw_delta = -42
+    req_state = _make_req_state(raw.clone())
+    _, key_caches = _make_key_caches(1, seed=14)
+    with _config_ctx():
+        delta = _rebase(req_state, key_caches, rotary=_make_rope())
+    assert delta == 208
+
+    # ... preemption: all blocks freed, re-prefill from scratch.
+    req_state.block_ids = ([7, 8, 9],)
+    req_state.num_computed_tokens = 0
+    clear_rebase_offset(req_state)
+
+    assert req_state.mrope_rebase_offset == 0
+    assert torch.equal(req_state.mrope_positions, raw)
+    assert req_state.mrope_position_delta == raw_delta
+
+
+def test_stale_offset_after_a_kv_reset_is_caught_before_it_is_read():
+    """Backstop (shared `_prepare_inputs` seat, so it also covers runners that
+    duplicate `_update_states`): an offset that outlived its KV would make the
+    re-prefill read negative positions, which index cos_sin_cache from the end
+    silently. Seat B refuses instead."""
+    packed, key_caches = _make_key_caches(1, seed=15)
+    req_state = _make_req_state()
+    with _config_ctx():
+        assert _rebase(req_state, key_caches, rotary=_make_rope()) == 208
+        after_rebase = packed[0].clone()
+
+        # ... KV dropped and num_computed reset, but the offset left behind.
+        req_state.num_computed_tokens = 0
+        assert int(req_state.mrope_positions[:, 0].min()) < 0  # what would be read
+
+        with pytest.raises(AssertionError, match="outlived the rotated KV"):
+            _rebase(req_state, key_caches, rotary=_make_rope())
+
+    assert torch.equal(packed[0], after_rebase)
 
 
 # ----------------------------------------------------------------------------

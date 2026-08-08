@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Paged recent-window K rotation for streaming-KV position rebase.
 
-When a SinkWindow request's M-RoPE base crosses ``--streaming-kv-rebase-at``,
+When a SinkWindow request's M-RoPE window crosses ``--streaming-kv-rebase-at``,
 the runner rotates the recent window's cached K in place by the RoPE angle of
-−Δ (Δ = base − the aligned sink boundary), so the window's effective positions
-drop from ``[base, base+W)`` back to ``[start_size, start_size+W)``. Sinks are
-already bounded and are never rotated; V carries no positional encoding and is
-never touched (this module only ever receives K).
+−Δ (Δ = the window's LOWEST effective position − the aligned sink boundary), so
+the window's effective positions drop from ``[m, m+span]`` back to
+``[start_size, start_size+span]``. Sinks are already bounded and are never
+rotated; V carries no positional encoding and is never touched (this module
+only ever receives K).
 
 Uniform-Δ exactness (the proven prior art this module re-expresses): Qwen's
 M-RoPE places the shared sequence base on all three T/H/W axes, and every
@@ -24,11 +25,28 @@ test_structural_uniform_delta_equals_axis_shift_video_small_pos`` (commit
 638d2092a, branch ``feat/streaming-kv-mrope-reindex-b``); ported to
 ``tests/v1/attention/test_streaming_rebase.py``.
 
-Single-rotation invariant: config validation enforces
-``rebase_at >= start_size + 2*recent_size``, so consecutive rebase events are
-at least one full recent window apart and any cached K entry is rotated at
-most once before eviction claims it — the fp32-staged, cache-dtype write-back
+Single-rotation invariant, and where it is only near-exact. Config validation
+enforces ``rebase_at >= start_size + 2*recent_size``, and the trigger fires on
+``window_front + recent_size >= rebase_at``, so consecutive rebase events are
+at least ``recent_size`` POSITIONS apart. For a stream whose positions advance
+by at most one per token (text, and every measured Qwen3-Omni A/V workload —
+positions ≈ 0.056 × tokens), that is at least ``recent_size`` TOKENS of front
+advance, i.e. a full window turnover: any cached K entry is rotated at most
+once before eviction claims it and the fp32-staged, cache-dtype write-back
 rounding never compounds.
+
+Δ is anchored to the window's minimum ``m`` rather than its front ``F`` (so
+no alive token can be rebased onto a sink-block position), which costs
+``F − m`` of the spacing budget: the strong form needs
+``(F − m) <= W * (1 - r)`` with ``W = recent_size`` and ``r`` the mean
+positions-per-token rate over the window. Beyond that, the two events'
+windows can overlap by a few SEAM tokens, which are then rotated twice. That
+is a cost, not a correctness break: uniform-Δ rotations compose exactly
+(``R(−Δ₂)∘R(−Δ₁) == R(−(Δ₁+Δ₂))`` in fp32, pinned by the composition test),
+so a seam token pays one extra cache-dtype write-back round-trip. The
+shipping regime is covered with room to spare — at the minimum legal
+``rebase_at`` and the measured ``r``, ``W*(1-r)`` exceeds the observed
+``F − m`` by ~an order of magnitude.
 """
 
 from collections.abc import Sequence
@@ -50,10 +68,13 @@ logger = init_logger(__name__)
 def rebase_delta(base: int, start_size: int) -> int:
     """Rotation amount for a rebase event: Δ = base − start_size.
 
-    ``base`` is the alive window's lowest effective position and
+    ``base`` is the alive window's LOWEST effective position and
     ``start_size`` the boundary it should land on (callers pass the ALIGNED
     sink boundary): subtracting Δ from every window position puts the whole
-    window at or above the first position after the pinned sinks.
+    window at or above the first position after the pinned sinks. Anchoring on
+    the minimum rather than the window front is what keeps multimodal windows
+    (whose axes are spread within a token) off the sink positions; see the
+    module docstring for the spacing it costs the single-rotation invariant.
     """
     assert base >= start_size, f"rebase with base={base} < start_size={start_size}"
     return base - start_size
@@ -250,6 +271,30 @@ def apply_rebase_offset(req_state: "CachedRequestState") -> None:
     req_state.mrope_position_delta -= offset
 
 
+def clear_rebase_offset(req_state: "CachedRequestState") -> None:
+    """Drop the rebase offset and un-shift the positions with it.
+
+    The offset only ever describes cached K that was rotated in place, so it
+    must not outlive that K. Preemption frees EVERY block of the request and
+    resets ``num_computed_tokens`` to 0, and SinkWindow groups have prefix
+    caching disabled, so the resumed request re-prefills from token 0 into
+    fresh blocks: without this, the re-prefill would read the stored tensor
+    from index 0, i.e. at ``raw - offset``, and those negative positions index
+    ``cos_sin_cache`` from the END silently. Un-shifting (rather than
+    asserting) keeps the session alive — the next threshold crossing simply
+    rebases again.
+    """
+    offset = req_state.mrope_rebase_offset
+    if not offset:
+        return
+    positions = req_state.mrope_positions
+    assert positions is not None and req_state.mrope_position_delta is not None
+    _assert_positions_writable(positions)
+    positions += offset
+    req_state.mrope_position_delta += offset
+    req_state.mrope_rebase_offset = 0
+
+
 def _effective_position(req_state: "CachedRequestState", token_idx: int) -> int:
     """Largest effective M-RoPE axis value of one token of the request."""
     positions = req_state.mrope_positions
@@ -331,6 +376,22 @@ def maybe_rebase_request(
 
     block_size = kv_cache_spec.block_size
     num_computed = req_state.num_computed_tokens
+    if req_state.mrope_rebase_offset:
+        # Backstop for every path that discards the rotated K without clearing
+        # the offset (see clear_rebase_offset): this step reads the stored
+        # tensor from `num_computed` onwards, and a stale offset shows up there
+        # as a negative effective position, which cos_sin_cache would index
+        # from the end SILENTLY.
+        assert (
+            _alive_position_bounds(req_state, num_computed, num_computed + 1)[0] >= 0
+        ), (
+            f"request {req_state.req_id} is about to read M-RoPE position "
+            f"{_alive_position_bounds(req_state, num_computed, num_computed + 1)[0]} "
+            f"< 0 at token {num_computed}: its rebase offset "
+            f"({req_state.mrope_rebase_offset}) outlived the rotated KV it "
+            "describes. Every path that drops a request's cached K must call "
+            "clear_rebase_offset (preemption resume does)."
+        )
     sink_blocks, tail_start, num_valid_blocks, capped = sinkwindow_row_geometry(
         num_computed, block_size, kv_cache_spec.start_size, kv_cache_spec.sliding_window
     )
@@ -340,7 +401,13 @@ def maybe_rebase_request(
         # Nothing alive past the sinks yet.
         return 0
 
-    # Cheap per-step probe; the exact bounds below cost O(window).
+    # Cheap O(1) trigger probe: the window FRONT stands in for the whole
+    # window, which assumes positions advance by at most one per token (see
+    # the module docstring — true for text and for every measured Qwen3-Omni
+    # A/V workload). A stream that advances positions FASTER than tokens
+    # under-triggers here and trips the post-event assert below instead of
+    # corrupting anything; that fail-loud posture is deliberate, the shipping
+    # geometry is covered by the validation stage.
     recent_size = kv_cache_spec.sliding_window
     if _effective_position(req_state, window_start) + recent_size < rebase_at:
         return 0
@@ -371,8 +438,13 @@ def maybe_rebase_request(
     assert req_state.mrope_position_delta is not None
     req_state.mrope_position_delta -= delta
     assert top - delta < rebase_at, (
-        f"rebase left effective positions at {top - delta} >= "
-        f"--streaming-kv-rebase-at {rebase_at}"
+        f"rebase left request {req_state.req_id} at effective position "
+        f"{top - delta} >= --streaming-kv-rebase-at {rebase_at}: the window "
+        f"spans {top - base} positions over {num_computed - window_start} "
+        "tokens, i.e. this stream advances MORE than one position per token, "
+        "which the O(1) trigger probe (window front + recent_size) "
+        "under-estimates. Raise --streaming-kv-recent-size or lower "
+        "--streaming-kv-rebase-at to restore the headroom."
     )
     logger.info(
         "[streaming-kv] rebase req=%s delta=%d new_base=%d recent_tokens=%d",

@@ -151,6 +151,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.attention.streaming_rebase import (
     apply_rebase_offset,
+    clear_rebase_offset,
     maybe_rebase_request,
 )
 from vllm.v1.core.sched.output import NewRequestData
@@ -1438,6 +1439,12 @@ class GPUModelRunner(
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
+                # Preemption freed every block and reset num_computed_tokens to
+                # 0, so the rotated K a streaming-KV rebase offset describes is
+                # gone and the re-prefill starts from token 0. Drop the offset
+                # with the KV it described, or that re-prefill would read the
+                # stored positions at `raw - offset`, i.e. negative.
+                clear_rebase_offset(req_state)
 
             if req_index is None:
                 # The request is not in the persistent batch.
