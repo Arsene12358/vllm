@@ -100,6 +100,15 @@ class CacheConfig:
     streaming_kv_recent_size: int | None = None
     """StreamingLLM-style recent-window size: number of most-recent tokens
     whose KV entries are kept. See `streaming_kv_start_size`."""
+    streaming_kv_rebase_at: int | None = None
+    """Position threshold for streaming-KV position rebase: when a request's
+    RoPE base position crosses this value, the runner rotates the recent
+    window's cached K in place so effective positions restart just after the
+    sinks, keeping positions bounded on unbounded streams. Requires both
+    `streaming_kv_start_size` and `streaming_kv_recent_size`, and must be >=
+    `start_size + 2*recent_size` (the single-rotation invariant: consecutive
+    rebase events stay at least one full recent window apart, so any cached K
+    entry is rotated at most once before eviction claims it)."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
@@ -329,5 +338,29 @@ class CacheConfig:
                 raise ValueError(
                     f"streaming_kv_recent_size must be > 0, got "
                     f"{self.streaming_kv_recent_size}"
+                )
+        if self.streaming_kv_rebase_at is not None:
+            start = self.streaming_kv_start_size
+            recent = self.streaming_kv_recent_size
+            if start is None or recent is None:
+                raise ValueError(
+                    "--streaming-kv-rebase-at requires streaming-kv mode: set "
+                    "both --streaming-kv-start-size and "
+                    "--streaming-kv-recent-size (got streaming_kv_rebase_at="
+                    f"{self.streaming_kv_rebase_at} with neither set)."
+                )
+            threshold = start + 2 * recent
+            if self.streaming_kv_rebase_at < threshold:
+                raise ValueError(
+                    f"streaming_kv_rebase_at={self.streaming_kv_rebase_at} "
+                    "violates the single-rotation invariant: it must be >= "
+                    "streaming_kv_start_size + 2*streaming_kv_recent_size = "
+                    f"{start} + 2*{recent} = {threshold}. This spacing keeps "
+                    "consecutive rebase events at least one full recent "
+                    "window apart, so any cached K entry is rotated at most "
+                    "once before eviction claims it and the write-back "
+                    "rounding never compounds. Raise --streaming-kv-rebase-at "
+                    f"to at least {threshold} or shrink the streaming-kv "
+                    "sizes."
                 )
         return self

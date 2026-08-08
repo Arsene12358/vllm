@@ -700,6 +700,7 @@ class EngineArgs:
 
     streaming_kv_start_size: int | None = CacheConfig.streaming_kv_start_size
     streaming_kv_recent_size: int | None = CacheConfig.streaming_kv_recent_size
+    streaming_kv_rebase_at: int | None = CacheConfig.streaming_kv_rebase_at
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     enable_mamba_cache_stochastic_rounding: bool = (
@@ -1198,6 +1199,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--streaming-kv-recent-size",
             **cache_kwargs["streaming_kv_recent_size"],
+        )
+        cache_group.add_argument(
+            "--streaming-kv-rebase-at",
+            **cache_kwargs["streaming_kv_rebase_at"],
         )
         cache_group.add_argument(
             "--mamba-cache-dtype", **cache_kwargs["mamba_cache_dtype"]
@@ -1934,6 +1939,7 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
             streaming_kv_start_size=self.streaming_kv_start_size,
             streaming_kv_recent_size=self.streaming_kv_recent_size,
+            streaming_kv_rebase_at=self.streaming_kv_rebase_at,
         )
 
         if resolved_cache_dtype.startswith("turboquant_"):

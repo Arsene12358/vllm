@@ -26,6 +26,7 @@ from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
+from vllm.utils.math_utils import cdiv
 
 from .attention import AttentionConfig
 from .cache import CacheConfig
@@ -2231,7 +2232,8 @@ class VllmConfig:
             )
 
     def validate_block_size(self) -> None:
-        """Validate block_size against DCP and mamba constraints.
+        """Validate block_size against DCP, mamba and streaming-KV rebase
+        constraints.
 
         Called after Platform.update_block_size_for_backend() has
         finalised block_size.
@@ -2276,6 +2278,30 @@ class VllmConfig:
                 "to schedule a multiple of block_size tokens even if they are "
                 "in the middle of a mm input"
             )
+
+        # Streaming-KV rebase sink-block alignment. Seated here rather than
+        # in the config validators because the attention backend may
+        # renegotiate block_size after config validation (Platform.
+        # update_block_size_for_backend at executor init); this method is the
+        # documented post-finalisation check point.
+        if self.cache_config.streaming_kv_rebase_at is not None:
+            start_size = self.cache_config.streaming_kv_start_size
+            assert start_size is not None  # CacheConfig validator guarantees
+            if start_size % block_size != 0:
+                boundary = cdiv(start_size, block_size) * block_size
+                raise ValueError(
+                    "--streaming-kv-rebase-at requires streaming_kv_start_size "
+                    "to be a multiple of the KV cache block size, got "
+                    f"start_size={start_size} with block_size={block_size}. "
+                    "The compacted row packs the sinks as whole blocks, so "
+                    "the rebase rotation starts at the sink-block boundary "
+                    f"({boundary}) while the rebase lands the recent window's "
+                    f"front at start_size={start_size}; the pinned tokens in "
+                    f"[{start_size}, {boundary}) would be overlapped by "
+                    "rebased positions without ever being rotated. Use a "
+                    f"start size that is a multiple of {block_size} "
+                    f"(e.g. {boundary})."
+                )
 
     @model_validator(mode="after")
     def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
@@ -2335,6 +2361,56 @@ class VllmConfig:
                 "at full length, so connector block accounting over-commits "
                 "blocks whose KV was already freed."
             )
+
+        # Rebase mode pins the KV cache dtype to bf16/fp16: the rotation
+        # (vllm/v1/attention/streaming_rebase.py) stages in fp32 and writes
+        # back in the cache dtype, and its single-rotation error bound is
+        # only validated for bf16/fp16 write-back rounding. Seated here (not
+        # in CacheConfig) because resolving "auto" needs model_config;
+        # cache_dtype is already final at this point — engine entry points
+        # fold checkpoint-declared KV quantization into it before VllmConfig
+        # is built (resolve_kv_cache_dtype_string in create_engine_config) —
+        # and the checkpoint sniff is re-run below so directly-constructed
+        # configs cannot slip a quantized-KV checkpoint through as "auto".
+        if self.cache_config.streaming_kv_rebase_at is not None:
+            from vllm.utils.torch_utils import get_kv_cache_quant_algo_string
+
+            rebase_dtype_msg = (
+                "--streaming-kv-rebase-at requires a bf16 or fp16 KV cache: "
+                "the rebase rotation stages in fp32 and writes back in the "
+                "cache dtype, and its single-rotation error bound is only "
+                "validated for bf16/fp16 write-back. "
+            )
+            cache_dtype = self.cache_config.cache_dtype
+            if cache_dtype not in ("auto", "bfloat16", "float16"):
+                raise ValueError(
+                    rebase_dtype_msg + f"Got --kv-cache-dtype {cache_dtype!r}. "
+                    "Set --kv-cache-dtype bfloat16 or float16, or drop "
+                    "--streaming-kv-rebase-at."
+                )
+            if cache_dtype == "auto" and self.model_config is not None:
+                hf_cfg = getattr(self.model_config, "hf_config", None)
+                quant_cfg = getattr(hf_cfg, "quantization_config", None)
+                sniffed = (
+                    get_kv_cache_quant_algo_string(quant_cfg)
+                    if quant_cfg is not None
+                    else None
+                )
+                if sniffed not in (None, "auto"):
+                    raise ValueError(
+                        rebase_dtype_msg + "Got --kv-cache-dtype auto, which "
+                        f"resolves to {sniffed!r} because the model "
+                        "checkpoint declares KV cache quantization. Set "
+                        "--kv-cache-dtype bfloat16 or float16 (unquantized "
+                        "KV), or drop --streaming-kv-rebase-at."
+                    )
+                if self.model_config.dtype not in (torch.bfloat16, torch.float16):
+                    raise ValueError(
+                        rebase_dtype_msg + "Got --kv-cache-dtype auto, which "
+                        f"resolves to the model dtype {self.model_config.dtype}. "
+                        "Set --kv-cache-dtype bfloat16 or float16, or drop "
+                        "--streaming-kv-rebase-at."
+                    )
         return self
 
 

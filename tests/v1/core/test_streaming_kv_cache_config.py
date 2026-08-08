@@ -28,6 +28,20 @@ G1..G4 — startup guards for configurations the SinkWindow port does not
       G3 KV connectors are rejected at config time;
       G4 every decoder attention layer must end up with SinkWindowSpec (model
          classes that override get_kv_cache_spec never see the flags).
+R1..R4 — the --streaming-kv-rebase-at config wall. Every check has both legs
+      (fires on the bad config, inert on the good one and without the flag):
+      R1 CacheConfig validator: rebase_at requires both streaming-kv flags,
+         and rebase_at >= start_size + 2*recent_size (the single-rotation
+         invariant), boundary tested both ways;
+      R2 VllmConfig.validate_streaming_kv KV-dtype gate: the rebase rotation's
+         write-back rounding bound is only validated for bf16/fp16 caches, so
+         quantized KV dtypes — explicit, or "auto" resolving to a
+         checkpoint-declared KV quantization or a non-bf16/fp16 model dtype —
+         are rejected in rebase mode;
+      R3 VllmConfig.validate_block_size: start_size % block_size == 0 in
+         rebase mode, seated after the attention backend has finalised
+         block_size (it may renegotiate the config-time value);
+      R4 CLI: --streaming-kv-rebase-at round-trip.
 """
 
 import argparse
@@ -456,3 +470,223 @@ def test_uniformity_guard_off_when_streaming_kv_unset():
         ),
     }
     verify_streaming_kv_specs_uniform(specs, CacheConfig())
+
+
+# ----------------------------------------------------------------------------
+# R1 — CacheConfig validator: --streaming-kv-rebase-at arithmetic wall
+# ----------------------------------------------------------------------------
+# Production-shaped values: 128 + 2*1024 = 2176 <= 49152.
+_REBASE_OK = {
+    "streaming_kv_start_size": 128,
+    "streaming_kv_recent_size": 1024,
+    "streaming_kv_rebase_at": 49152,
+}
+
+
+def test_rebase_at_disabled_by_default():
+    assert CacheConfig().streaming_kv_rebase_at is None
+    assert CacheConfig(**_STREAMING_KV).streaming_kv_rebase_at is None
+
+
+def test_rebase_at_valid_config_ok():
+    c = CacheConfig(**_REBASE_OK)
+    assert c.streaming_kv_rebase_at == 49152
+
+
+def test_rebase_at_requires_streaming_kv_flags():
+    with pytest.raises(
+        ValueError,
+        match=r"--streaming-kv-start-size and\s+--streaming-kv-recent-size",
+    ):
+        CacheConfig(streaming_kv_rebase_at=49152)
+
+
+@pytest.mark.parametrize("rebase_at", [2175, 2112, 1, 0, -5])
+def test_rebase_at_below_single_rotation_threshold_rejected(rebase_at):
+    """128 + 2*1024 = 2176 is the minimum spacing that keeps consecutive
+    rebase events one full recent window apart (single-rotation invariant)."""
+    with pytest.raises(ValueError, match="single-rotation invariant"):
+        CacheConfig(
+            streaming_kv_start_size=128,
+            streaming_kv_recent_size=1024,
+            streaming_kv_rebase_at=rebase_at,
+        )
+
+
+def test_rebase_at_exactly_at_threshold_ok():
+    """The invariant is >=, so the boundary itself must pass."""
+    c = CacheConfig(
+        streaming_kv_start_size=128,
+        streaming_kv_recent_size=1024,
+        streaming_kv_rebase_at=2176,
+    )
+    assert c.streaming_kv_rebase_at == 2176
+
+
+def test_rebase_at_threshold_error_shows_arithmetic():
+    with pytest.raises(ValueError, match=r"128 \+ 2\*1024 = 2176"):
+        CacheConfig(
+            streaming_kv_start_size=128,
+            streaming_kv_recent_size=1024,
+            streaming_kv_rebase_at=2000,
+        )
+
+
+# ----------------------------------------------------------------------------
+# R2 — KV-dtype gate for rebase mode (VllmConfig.validate_streaming_kv seat)
+# ----------------------------------------------------------------------------
+def _fake_model_config(dtype=torch.bfloat16, quantization_config=None):
+    """Just the attributes the dtype gate reads; a real ModelConfig needs hub
+    access. Mirrors resolve_kv_cache_dtype_string's hf_config traversal."""
+    return SimpleNamespace(
+        dtype=dtype,
+        hf_config=SimpleNamespace(quantization_config=quantization_config),
+    )
+
+
+def _validate_streaming_kv(cache_config, model_config):
+    fake = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=model_config,
+        speculative_config=None,
+        kv_transfer_config=None,
+    )
+    return VllmConfig.validate_streaming_kv(fake)
+
+
+@pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3", "fp8_e5m2", "nvfp4"])
+def test_rebase_rejects_quantized_kv_cache_dtype(cache_dtype):
+    with pytest.raises(ValueError, match="bf16 or fp16 KV cache"):
+        VllmConfig(cache_config=CacheConfig(cache_dtype=cache_dtype, **_REBASE_OK))
+
+
+@pytest.mark.parametrize("cache_dtype", ["bfloat16", "float16"])
+def test_rebase_accepts_half_precision_kv_cache_dtype(cache_dtype):
+    cfg = VllmConfig(cache_config=CacheConfig(cache_dtype=cache_dtype, **_REBASE_OK))
+    assert cfg.cache_config.streaming_kv_rebase_at == 49152
+
+
+def test_quantized_kv_cache_dtype_allowed_without_rebase():
+    """The dtype gate is rebase-only: plain streaming-kv never rotates cached
+    K, so fp8 stays as supported as it was before this flag existed."""
+    cfg = VllmConfig(cache_config=CacheConfig(cache_dtype="fp8", **_STREAMING_KV))
+    assert cfg.cache_config.cache_dtype == "fp8"
+
+
+@pytest.mark.parametrize(
+    "model_dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"]
+)
+def test_rebase_auto_dtype_accepts_half_precision_model(model_dtype):
+    cfg = _validate_streaming_kv(
+        CacheConfig(**_REBASE_OK), _fake_model_config(dtype=model_dtype)
+    )
+    assert cfg.cache_config.streaming_kv_rebase_at == 49152
+
+
+def test_rebase_auto_dtype_rejects_fp32_model():
+    """ "auto" resolves to the model dtype; fp32 is outside the validated
+    bf16/fp16 write-back envelope."""
+    with pytest.raises(ValueError, match="float32"):
+        _validate_streaming_kv(
+            CacheConfig(**_REBASE_OK), _fake_model_config(dtype=torch.float32)
+        )
+
+
+def test_rebase_auto_dtype_rejects_fp8_kv_checkpoint():
+    """Engine entry points fold checkpoint-declared KV quantization into
+    cache_dtype before VllmConfig is built (resolve_kv_cache_dtype_string);
+    the gate re-runs the sniff so directly-constructed configs cannot slip
+    an fp8-KV checkpoint through as "auto"."""
+    quant = {"quant_method": "modelopt", "kv_cache_quant_algo": "fp8"}
+    with pytest.raises(ValueError, match="KV cache quantization"):
+        _validate_streaming_kv(
+            CacheConfig(**_REBASE_OK),
+            _fake_model_config(dtype=torch.bfloat16, quantization_config=quant),
+        )
+
+
+def test_rebase_auto_dtype_without_model_config_skips():
+    """model_config is only None in unit tests; every engine entry point
+    builds one before VllmConfig. The explicit-string leg still applies."""
+    cfg = VllmConfig(cache_config=CacheConfig(**_REBASE_OK))
+    assert cfg.cache_config.streaming_kv_rebase_at == 49152
+
+
+# ----------------------------------------------------------------------------
+# R3 — sink-block alignment gate (VllmConfig.validate_block_size seat)
+# ----------------------------------------------------------------------------
+def test_rebase_unaligned_start_size_rejected_at_block_size_seat():
+    """Rotation starts at the sink-block boundary (sinks are packed as whole
+    blocks) while the rebase lands the window front at start_size; unaligned
+    start_size would leave the pinned slack tokens [start_size, boundary)
+    overlapped by rebased positions but never rotated."""
+    cfg = VllmConfig(
+        cache_config=CacheConfig(
+            streaming_kv_start_size=120,
+            streaming_kv_recent_size=1024,
+            streaming_kv_rebase_at=49152,
+        )
+    )
+    cfg.cache_config.block_size = 16
+    with pytest.raises(ValueError, match="multiple of"):
+        cfg.validate_block_size()
+
+
+def test_rebase_alignment_checked_against_renegotiated_block_size():
+    """Why this seat and not the config validator: the attention backend may
+    renegotiate block_size after config validation (Platform.
+    update_block_size_for_backend), and validate_block_size is the documented
+    post-finalisation check point (engine core calls it before KV init)."""
+    cfg = VllmConfig(cache_config=CacheConfig(**_REBASE_OK))
+    cfg.cache_config.block_size = 32  # renegotiated, still aligned: 128 % 32
+    cfg.validate_block_size()
+    cfg.cache_config.block_size = 48  # renegotiated, misaligned: 128 % 48
+    with pytest.raises(ValueError, match="multiple of"):
+        cfg.validate_block_size()
+
+
+def test_rebase_aligned_start_size_passes_block_size_seat():
+    cfg = VllmConfig(cache_config=CacheConfig(**_REBASE_OK))
+    cfg.cache_config.block_size = 16
+    cfg.validate_block_size()  # must not raise
+
+
+def test_unaligned_start_size_allowed_without_rebase():
+    """Plain streaming-kv keeps supporting unaligned start_size: the compacted
+    row pins the slack tokens and nothing ever rotates them."""
+    cfg = VllmConfig(
+        cache_config=CacheConfig(
+            streaming_kv_start_size=120, streaming_kv_recent_size=1024
+        )
+    )
+    cfg.cache_config.block_size = 16
+    cfg.validate_block_size()  # must not raise
+
+
+# ----------------------------------------------------------------------------
+# R4 — CLI plumbing for --streaming-kv-rebase-at
+# ----------------------------------------------------------------------------
+def test_streaming_kv_rebase_at_cli_roundtrip():
+    parser = argparse.ArgumentParser()
+    EngineArgs.add_cli_args(parser)
+    args = parser.parse_args(
+        [
+            "--streaming-kv-start-size",
+            "128",
+            "--streaming-kv-recent-size",
+            "1024",
+            "--streaming-kv-rebase-at",
+            "49152",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.streaming_kv_start_size == 128
+    assert engine_args.streaming_kv_recent_size == 1024
+    assert engine_args.streaming_kv_rebase_at == 49152
+
+
+def test_streaming_kv_rebase_at_cli_defaults_to_none():
+    parser = argparse.ArgumentParser()
+    EngineArgs.add_cli_args(parser)
+    engine_args = EngineArgs.from_cli_args(parser.parse_args([]))
+    assert engine_args.streaming_kv_rebase_at is None
