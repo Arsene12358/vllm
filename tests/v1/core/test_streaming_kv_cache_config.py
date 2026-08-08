@@ -605,6 +605,34 @@ def test_rebase_auto_dtype_rejects_fp8_kv_checkpoint():
         )
 
 
+def test_rebase_auto_dtype_rejects_compressed_tensors_kv_scheme():
+    """compressed-tensors FP8-KV checkpoints (RedHatAI style) sit outside the
+    modelopt-only sniff, so nothing rewrites cache_dtype before model load —
+    where Attention.__init__ flips "auto" to fp8 AFTER every validator has
+    run. The gate mirrors that trigger (non-null kv_cache_scheme) and rejects
+    up front."""
+    quant = {
+        "quant_method": "compressed-tensors",
+        "kv_cache_scheme": {"dynamic": False, "num_bits": 8, "type": "float"},
+    }
+    with pytest.raises(ValueError, match="kv_cache_scheme"):
+        _validate_streaming_kv(
+            CacheConfig(**_REBASE_OK),
+            _fake_model_config(dtype=torch.bfloat16, quantization_config=quant),
+        )
+
+
+def test_rebase_auto_dtype_accepts_compressed_tensors_weight_only():
+    """Weight-only compressed-tensors checkpoints carry kv_cache_scheme: null
+    in config.json; the KV cache stays model-dtype and rebase stays allowed."""
+    quant = {"quant_method": "compressed-tensors", "kv_cache_scheme": None}
+    cfg = _validate_streaming_kv(
+        CacheConfig(**_REBASE_OK),
+        _fake_model_config(dtype=torch.bfloat16, quantization_config=quant),
+    )
+    assert cfg.cache_config.streaming_kv_rebase_at == 49152
+
+
 def test_rebase_auto_dtype_without_model_config_skips():
     """model_config is only None in unit tests; every engine entry point
     builds one before VllmConfig. The explicit-string leg still applies."""

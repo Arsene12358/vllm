@@ -129,6 +129,11 @@ def rotate_kv_pages(
             ``_uniform_delta_cos_sin``.
         block_size: Tokens per page; must match ``key_cache.shape[1]``.
     """
+    assert key_cache.dtype in (torch.bfloat16, torch.float16, torch.float32), (
+        f"streaming-kv rebase requires a bf16/fp16 KV cache (fp32 allowed for "
+        f"tests), got {key_cache.dtype}; see --streaming-kv-rebase-at dtype "
+        "requirements"
+    )
     if delta == 0 or token_end <= token_start:
         return
     assert getattr(rotary, "scaling_factor", None) is None, (

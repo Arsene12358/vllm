@@ -2366,12 +2366,15 @@ class VllmConfig:
         # (vllm/v1/attention/streaming_rebase.py) stages in fp32 and writes
         # back in the cache dtype, and its single-rotation error bound is
         # only validated for bf16/fp16 write-back rounding. Seated here (not
-        # in CacheConfig) because resolving "auto" needs model_config;
-        # cache_dtype is already final at this point — engine entry points
-        # fold checkpoint-declared KV quantization into it before VllmConfig
-        # is built (resolve_kv_cache_dtype_string in create_engine_config) —
-        # and the checkpoint sniff is re-run below so directly-constructed
-        # configs cannot slip a quantized-KV checkpoint through as "auto".
+        # in CacheConfig) because resolving "auto" needs model_config.
+        # cache_dtype is final at this point EXCEPT one late path: modelopt-
+        # style checkpoint KV quantization is folded in before VllmConfig is
+        # built (resolve_kv_cache_dtype_string in create_engine_config; the
+        # sniff is re-run below for directly-constructed configs), but a
+        # compressed-tensors-style kv_cache_scheme is only applied at model
+        # load, when Attention.__init__ flips "auto" to "fp8" AFTER every
+        # validator has run — so this branch mirrors that trigger and rejects
+        # whenever it would fire.
         if self.cache_config.streaming_kv_rebase_at is not None:
             from vllm.utils.torch_utils import get_kv_cache_quant_algo_string
 
@@ -2401,6 +2404,24 @@ class VllmConfig:
                         rebase_dtype_msg + "Got --kv-cache-dtype auto, which "
                         f"resolves to {sniffed!r} because the model "
                         "checkpoint declares KV cache quantization. Set "
+                        "--kv-cache-dtype bfloat16 or float16 (unquantized "
+                        "KV), or drop --streaming-kv-rebase-at."
+                    )
+                # Mirror of Attention.__init__'s late mutation trigger
+                # (non-null kv_cache_scheme + "auto" -> cache_dtype = "fp8"
+                # at model load): compressed-tensors-style checkpoints sit
+                # outside the modelopt sniff above.
+                kv_scheme = (
+                    quant_cfg.get("kv_cache_scheme")
+                    if isinstance(quant_cfg, dict)
+                    else getattr(quant_cfg, "kv_cache_scheme", None)
+                )
+                if kv_scheme is not None:
+                    raise ValueError(
+                        rebase_dtype_msg + "Got --kv-cache-dtype auto, and "
+                        "the model checkpoint's quantization config declares "
+                        f"a kv_cache_scheme ({kv_scheme!r}), which vLLM "
+                        "applies as an fp8 KV cache at model load. Set "
                         "--kv-cache-dtype bfloat16 or float16 (unquantized "
                         "KV), or drop --streaming-kv-rebase-at."
                     )

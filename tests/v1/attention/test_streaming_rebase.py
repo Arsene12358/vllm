@@ -496,6 +496,22 @@ def test_yarn_scaled_rotary_rejected():
     assert torch.equal(kv, snap)  # rejected before any cache mutation
 
 
+def test_fp8_kv_cache_rejected():
+    """Belt-and-suspenders for the config-time dtype gate: compressed-tensors
+    checkpoints flip cache_dtype to fp8 at model load (Attention.__init__),
+    AFTER every config validator has run, so the rotation itself must refuse
+    a quantized cache instead of silently writing back ``seg.to(fp8)``."""
+    torch.manual_seed(24)
+    with _config_ctx():
+        rope = _make_rope()
+        kv, key_cache, _ = _make_packed_cache(4, torch.float8_e4m3fn)
+        snap = kv.clone()
+        with pytest.raises(AssertionError, match="bf16/fp16 KV cache"):
+            rotate_kv_pages(key_cache, [0, 1], 0, 20, 50, rope, BLOCK_SIZE)
+    # Rejected before any cache mutation (uint8 view: fp8 has no CPU eq).
+    assert torch.equal(kv.view(torch.uint8), snap.view(torch.uint8))
+
+
 # --------------------------------------------------------------------------
 # (e) bf16 write-back single-rotation error bound.
 # --------------------------------------------------------------------------
