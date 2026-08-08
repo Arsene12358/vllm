@@ -443,8 +443,11 @@ def maybe_rebase_request(
         f"spans {top - base} positions over {num_computed - window_start} "
         "tokens, i.e. this stream advances MORE than one position per token, "
         "which the O(1) trigger probe (window front + recent_size) "
-        "under-estimates. Raise --streaming-kv-recent-size or lower "
-        "--streaming-kv-rebase-at to restore the headroom."
+        "under-estimates. The bound is aligned_start + window span < "
+        "rebase_at, so restore the headroom by RAISING "
+        "--streaming-kv-rebase-at (more budget) or LOWERING "
+        "--streaming-kv-recent-size (shorter window, hence smaller span; it "
+        "also lowers the start + 2*recent validator floor)."
     )
     logger.info(
         "[streaming-kv] rebase req=%s delta=%d new_base=%d recent_tokens=%d",
