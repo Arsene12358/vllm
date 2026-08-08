@@ -149,6 +149,10 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.attention.streaming_rebase import (
+    apply_rebase_offset,
+    maybe_rebase_request,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -568,6 +572,11 @@ class GPUModelRunner(
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
+        # Streaming-KV rebase (Seat B) inputs, resolved once after KV init:
+        # (kv_cache_group_id, spec, per-layer K views, rotary module).
+        self._streaming_rebase_context: (
+            tuple[int, SinkWindowSpec, list[torch.Tensor], MRotaryEmbedding] | None
+        ) = None
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -1634,6 +1643,9 @@ class GPUModelRunner(
 
         if self.uses_mrope:
             self._init_mrope_positions(req_state)
+            # Seat A: the recompute above rebuilt the raw positions, so the
+            # session's accumulated streaming-KV rebase has to be re-applied.
+            apply_rebase_offset(req_state)
 
         return req_state
 
@@ -1936,6 +1948,86 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def _build_streaming_rebase_context(
+        self,
+    ) -> tuple[int, SinkWindowSpec, list[torch.Tensor], MRotaryEmbedding]:
+        """Resolve the streaming-KV rebase inputs once.
+
+        The K views alias the KV cache tensors bound at initialization and the
+        rotary module is shared by the model's layers, so both are stable for
+        the life of the runner.
+        """
+        sink_groups = [
+            (group_id, attn_group)
+            for group_id, attn_groups in enumerate(self.attn_groups)
+            for attn_group in attn_groups
+            if isinstance(attn_group.kv_cache_spec, SinkWindowSpec)
+        ]
+        assert sink_groups, (
+            "--streaming-kv-rebase-at is set but no KV cache group uses SinkWindowSpec"
+        )
+        group_ids = {group_id for group_id, _ in sink_groups}
+        assert len(group_ids) == 1, (
+            "streaming-KV rebase expects a single SinkWindow KV cache group, "
+            f"got {sorted(group_ids)}"
+        )
+        group_id = sink_groups[0][0]
+        spec = cast(SinkWindowSpec, sink_groups[0][1].kv_cache_spec)
+        forward_context = self.compilation_config.static_forward_context
+        # Packed FlashAttention layout -> [num_blocks, block_size,
+        # num_kv_heads, head_size] K view, as FlashAttentionImpl.forward does.
+        key_caches = [
+            forward_context[layer_name]
+            .kv_cache.transpose(1, 2)
+            .split(spec.head_size, dim=-1)[0]
+            for _, attn_group in sink_groups
+            for layer_name in attn_group.layer_names
+            if layer_name not in self.runner_only_attn_layers
+        ]
+        rotaries = {
+            id(module): module
+            for module in self.get_model().modules()
+            if isinstance(module, MRotaryEmbedding)
+        }
+        assert rotaries, (
+            "--streaming-kv-rebase-at requires an M-RoPE model, but no "
+            "MRotaryEmbedding module was found"
+        )
+        rotary = next(iter(rotaries.values()))
+        geometry = (
+            rotary.base,
+            rotary.rotary_dim,
+            rotary.head_size,
+            rotary.is_neox_style,
+        )
+        assert all(
+            (m.base, m.rotary_dim, m.head_size, m.is_neox_style) == geometry
+            for m in rotaries.values()
+        ), (
+            "streaming-KV rebase rotates every layer by one angle, but this "
+            "model has M-RoPE layers with different rope geometries"
+        )
+        return group_id, spec, key_caches, rotary
+
+    def _maybe_rebase_streaming_positions(self) -> None:
+        """Seat B: rebase the positions of any SinkWindow request whose recent
+        window is about to cross `--streaming-kv-rebase-at`."""
+        rebase_at = self.cache_config.streaming_kv_rebase_at
+        assert rebase_at is not None
+        if self._streaming_rebase_context is None:
+            self._streaming_rebase_context = self._build_streaming_rebase_context()
+        group_id, spec, key_caches, rotary = self._streaming_rebase_context
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests[req_id]
+            maybe_rebase_request(
+                req_state,
+                key_caches=key_caches,
+                block_ids=req_state.block_ids[group_id],
+                kv_cache_spec=spec,
+                rebase_at=rebase_at,
+                rotary=rotary,
+            )
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1952,6 +2044,16 @@ class GPUModelRunner(
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+
+        # Seat B: rebase streaming-KV positions before anything reads them.
+        # `_update_states` has already refreshed block_ids / num_computed and
+        # the scheduler has already evicted this step's middle blocks, while
+        # `_calc_mrope_positions` below and the KV writes of this step both
+        # still lie ahead. Outside cudagraph capture (`_dummy_run` never calls
+        # `_prepare_inputs`) and stream-ordered behind the previous step's
+        # attention by `execute_model`'s input-prep synchronisation.
+        if self.cache_config.streaming_kv_rebase_at is not None:
+            self._maybe_rebase_streaming_positions()
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -3265,6 +3367,16 @@ class GPUModelRunner(
 
             if self.is_multimodal_pruning_enabled and self.uses_mrope:
                 assert req_state.mrope_positions is not None
+                # This runs AFTER the rebase seats and overwrites both position
+                # fields from scratch, which would drop the session's rebase.
+                # Rejected at startup by VllmConfig.validate_streaming_kv.
+                assert not req_state.mrope_rebase_offset, (
+                    "multimodal pruning recomputes M-RoPE positions and would "
+                    "silently revert the streaming-KV rebase of request "
+                    f"{req_state.req_id} (offset "
+                    f"{req_state.mrope_rebase_offset}); --video-pruning-rate "
+                    "and --streaming-kv-rebase-at are mutually exclusive"
+                )
                 should_sync_mrope_positions = True
                 old_mm_embeds_req = mm_embeds_req
                 mm_embeds_req, new_mrope_positions, new_delta = (

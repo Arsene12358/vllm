@@ -46,6 +46,12 @@ class CachedRequestState:
     mrope_positions: torch.Tensor | None = None
     mrope_position_delta: int | None = None
 
+    # Cumulative streaming-KV position rebase (--streaming-kv-rebase-at):
+    # effective positions are `raw - mrope_rebase_offset`. Persistent because
+    # `_init_mrope_positions` re-derives the raw positions from scratch on
+    # every streaming-session chunk append.
+    mrope_rebase_offset: int = 0
+
     xdrope_positions: torch.Tensor | None = None
 
     lora_request: LoRARequest | None = None

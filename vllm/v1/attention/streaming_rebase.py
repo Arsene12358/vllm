@@ -4,10 +4,10 @@
 
 When a SinkWindow request's M-RoPE base crosses ``--streaming-kv-rebase-at``,
 the runner rotates the recent window's cached K in place by the RoPE angle of
-−Δ (Δ = base − start_size), so the window's effective positions drop from
-``[base, base+W)`` back to ``[start_size, start_size+W)``. Sinks are already
-bounded and are never rotated; V carries no positional encoding and is never
-touched (this module only ever receives K).
+−Δ (Δ = base − the aligned sink boundary), so the window's effective positions
+drop from ``[base, base+W)`` back to ``[start_size, start_size+W)``. Sinks are
+already bounded and are never rotated; V carries no positional encoding and is
+never touched (this module only ever receives K).
 
 Uniform-Δ exactness (the proven prior art this module re-expresses): Qwen's
 M-RoPE places the shared sequence base on all three T/H/W axes, and every
@@ -31,25 +31,68 @@ most once before eviction claims it — the fp32-staged, cache-dtype write-back
 rounding never compounds.
 """
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
+    from vllm.v1.kv_cache_interface import KVCacheSpec
+    from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+logger = init_logger(__name__)
 
 
 def rebase_delta(base: int, start_size: int) -> int:
     """Rotation amount for a rebase event: Δ = base − start_size.
 
-    ``base`` is the recent window's first effective position; subtracting Δ
-    from every window position lands the front exactly on ``start_size`` (the
-    first position after the pinned sinks).
+    ``base`` is the alive window's lowest effective position and
+    ``start_size`` the boundary it should land on (callers pass the ALIGNED
+    sink boundary): subtracting Δ from every window position puts the whole
+    window at or above the first position after the pinned sinks.
     """
     assert base >= start_size, f"rebase with base={base} < start_size={start_size}"
     return base - start_size
+
+
+def sinkwindow_row_geometry(
+    total_kv: int, block_size: int, start_size: int, recent_size: int
+) -> tuple[int, int, int, int]:
+    """Compacted-row geometry of one SinkWindow request.
+
+    Single source of truth for the ``[sink_blocks ++ recent_TAIL_blocks]``
+    mapping: used by the FA metadata builder (``compute_sinkwindow_rows``) to
+    rebuild block-table rows, and by the rebase event to address the same
+    rows. Both must agree or the rotation lands on the wrong keys.
+
+    Args:
+        total_kv: Logical KV length of the request, in tokens.
+        block_size: KV cache block size, in tokens.
+        start_size: Number of pinned sink tokens at the prefix.
+        recent_size: Length of the recent (tail) window, in tokens.
+
+    Returns:
+        ``(sink_blocks, tail_start, num_valid_blocks, capped)`` — the pinned
+        prefix block count, the first recent-tail block, one past the last
+        valid block, and the row's alive token count in compacted-row
+        coordinates.
+    """
+    sink_blocks = cdiv(start_size, block_size)
+    recent_blocks = recent_size // block_size
+    assert recent_blocks > 0, (
+        f"SinkWindow recent window ({recent_size} tokens) is smaller than the "
+        f"KV cache block size ({block_size}); it would round down to zero tail "
+        "blocks and decode would see only the sink prefix. Set "
+        "--streaming-kv-recent-size to at least the block size."
+    )
+    num_valid_blocks = cdiv(total_kv, block_size)
+    tail_start = max(sink_blocks, num_valid_blocks - recent_blocks)
+    capped = sink_blocks * block_size + (total_kv - tail_start * block_size)
+    return sink_blocks, tail_start, num_valid_blocks, capped
 
 
 def _apply_rotation(
@@ -169,6 +212,176 @@ def rotate_kv_pages(
         key_cache.dtype
     )
     key_cache[ids] = pages
+
+
+def _assert_positions_writable(positions: torch.Tensor) -> None:
+    """Refuse to rebase a broadcast position tensor.
+
+    Talker / code2wav stages synthesise positions as
+    ``torch.arange(n).unsqueeze(0).expand(3, n)`` — a stride-0 view whose
+    elements alias, so an in-place shift raises mid-way. Those requests are
+    already excluded by the ``SinkWindowSpec`` gate; this fires BEFORE any K
+    is rotated so a gating mistake can never leave K rotated with unshifted
+    positions.
+    """
+    assert 0 not in positions.stride(), (
+        "streaming-kv rebase got a stride-0 (expanded) M-RoPE position "
+        f"tensor (strides={tuple(positions.stride())}); it cannot be shifted "
+        "in place. Only SinkWindowSpec requests may be rebased — talker / "
+        "code2wav stages share one broadcast position row."
+    )
+
+
+def apply_rebase_offset(req_state: "CachedRequestState") -> None:
+    """Seat A: re-apply the request's persisted rebase offset.
+
+    ``_init_mrope_positions`` re-derives the WHOLE absolute position tensor
+    from scratch on every streaming-session chunk append, so a rebase applied
+    once would be silently reverted by the next chunk. Call this after every
+    recompute: effective positions are always ``raw - mrope_rebase_offset``.
+    """
+    offset = req_state.mrope_rebase_offset
+    if not offset:
+        return
+    positions = req_state.mrope_positions
+    assert positions is not None and req_state.mrope_position_delta is not None
+    _assert_positions_writable(positions)
+    positions -= offset
+    req_state.mrope_position_delta -= offset
+
+
+def _effective_position(req_state: "CachedRequestState", token_idx: int) -> int:
+    """Largest effective M-RoPE axis value of one token of the request."""
+    positions = req_state.mrope_positions
+    assert positions is not None
+    if token_idx < positions.shape[1]:
+        return int(positions[:, token_idx].max())
+    # Past the prompt: decode positions are synthesised as delta + index
+    # (MRotaryEmbedding.get_next_input_positions_tensor).
+    assert req_state.mrope_position_delta is not None
+    return req_state.mrope_position_delta + token_idx
+
+
+def _alive_position_bounds(
+    req_state: "CachedRequestState", start: int, end: int
+) -> tuple[int, int]:
+    """(min, max) effective M-RoPE position over logical tokens ``[start, end)``."""
+    positions = req_state.mrope_positions
+    assert positions is not None
+    num_stored = positions.shape[1]
+    bounds: list[int] = []
+    stored_end = min(end, num_stored)
+    if start < stored_end:
+        window = positions[:, start:stored_end]
+        bounds += [int(window.min()), int(window.max())]
+    if end > num_stored:
+        # Decode tail: delta + index, strictly increasing in the index.
+        delta = req_state.mrope_position_delta
+        assert delta is not None
+        bounds += [delta + max(start, num_stored), delta + end - 1]
+    assert bounds, f"empty alive range [{start}, {end})"
+    return min(bounds), max(bounds)
+
+
+def maybe_rebase_request(
+    req_state: "CachedRequestState",
+    *,
+    key_caches: Sequence[torch.Tensor],
+    block_ids: Sequence[int],
+    kv_cache_spec: "KVCacheSpec",
+    rebase_at: int,
+    rotary: "MRotaryEmbedding",
+) -> int:
+    """Seat B: rebase one request's positions if its window crossed the wall.
+
+    Rotates the alive recent window's cached K by ``-Δ`` on every layer,
+    accumulates ``Δ`` into ``req_state.mrope_rebase_offset`` (Seat A re-applies
+    it after each recompute) and shifts the live position state, so the
+    session's effective positions restart just after the pinned sinks instead
+    of growing past the rotary table's trained range.
+
+    ``Δ`` is measured from the ALIGNED sink boundary
+    (``cdiv(start_size, block_size) * block_size``) down to the alive window's
+    MINIMUM effective position, so no alive token can be rebased onto a
+    sink-block position and none can go negative.
+
+    Args:
+        req_state: The request's runner-side state; mutated in place.
+        key_caches: K view of every layer in the SinkWindow group
+            (``kv_cache.transpose(1, 2).split(head_size, dim=-1)[0]``). Layers
+            share positions, so one Δ applies to all of them, but each layer
+            owns its own K.
+        block_ids: The request's LOGICAL block-table row for that group
+            (evicted middle blocks still present as nulls).
+        kv_cache_spec: The group's spec. Anything but ``SinkWindowSpec`` is a
+            no-op — the gate is the spec, never ``uses_mrope``.
+        rebase_at: ``--streaming-kv-rebase-at``.
+        rotary: The model's rotary module (supplies theta / rotary_dim /
+            pairing).
+
+    Returns:
+        The Δ applied, or 0 when nothing was rebased.
+    """
+    from vllm.v1.kv_cache_interface import SinkWindowSpec
+
+    if not isinstance(kv_cache_spec, SinkWindowSpec):
+        return 0
+    if req_state.mrope_positions is None:
+        return 0
+
+    block_size = kv_cache_spec.block_size
+    num_computed = req_state.num_computed_tokens
+    sink_blocks, tail_start, num_valid_blocks, capped = sinkwindow_row_geometry(
+        num_computed, block_size, kv_cache_spec.start_size, kv_cache_spec.sliding_window
+    )
+    aligned_start = sink_blocks * block_size
+    window_start = tail_start * block_size
+    if capped <= aligned_start:
+        # Nothing alive past the sinks yet.
+        return 0
+
+    # Cheap per-step probe; the exact bounds below cost O(window).
+    recent_size = kv_cache_spec.sliding_window
+    if _effective_position(req_state, window_start) + recent_size < rebase_at:
+        return 0
+
+    base, top = _alive_position_bounds(req_state, window_start, num_computed)
+    delta = rebase_delta(base, aligned_start)
+    if delta == 0:
+        return 0
+    positions = req_state.mrope_positions
+    _assert_positions_writable(positions)
+
+    compacted_ids = list(block_ids[:sink_blocks]) + list(
+        block_ids[tail_start:num_valid_blocks]
+    )
+    for key_cache in key_caches:
+        rotate_kv_pages(
+            key_cache,
+            compacted_ids,
+            aligned_start,
+            capped,
+            delta,
+            rotary,
+            block_size,
+        )
+
+    req_state.mrope_rebase_offset += delta
+    positions -= delta
+    assert req_state.mrope_position_delta is not None
+    req_state.mrope_position_delta -= delta
+    assert top - delta < rebase_at, (
+        f"rebase left effective positions at {top - delta} >= "
+        f"--streaming-kv-rebase-at {rebase_at}"
+    )
+    logger.info(
+        "[streaming-kv] rebase req=%s delta=%d new_base=%d recent_tokens=%d",
+        req_state.req_id,
+        delta,
+        aligned_start,
+        capped - aligned_start,
+    )
+    return delta
 
 
 def _cos_sin_at(

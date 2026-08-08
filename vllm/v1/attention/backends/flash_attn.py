@@ -57,6 +57,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
+from vllm.v1.attention.streaming_rebase import sinkwindow_row_geometry
 from vllm.v1.kv_cache_interface import AttentionSpec, SinkWindowSpec
 from vllm.v1.worker.cp_utils import (
     run_split_fa2_dcp_context_attention,
@@ -352,27 +353,20 @@ def compute_sinkwindow_rows(
     Returns:
         Per-request sequence lengths in compacted-row coordinates.
     """
-    sink_blocks = cdiv(start_size, block_size)
-    recent_blocks = recent_size // block_size
-    assert recent_blocks > 0, (
-        f"SinkWindow recent window ({recent_size} tokens) is smaller than the "
-        f"KV cache block size ({block_size}); it would round down to zero tail "
-        "blocks and decode would see only the sink prefix. Set "
-        "--streaming-kv-recent-size to at least the block size."
-    )
     seq_lens_np = seq_lens_cpu[:num_reqs].numpy()
     capped = [0] * num_reqs
     for r in range(num_reqs):
         total_kv = int(seq_lens_np[r])
-        nvb = cdiv(total_kv, block_size)
-        tail_start = max(sink_blocks, nvb - recent_blocks)
+        # Shared with the position-rebase event, which addresses the same rows.
+        sink_blocks, tail_start, nvb, capped[r] = sinkwindow_row_geometry(
+            total_kv, block_size, start_size, recent_size
+        )
         n_tail = max(0, nvb - tail_start)
         dst[r, :sink_blocks] = block_table_tensor[r, :sink_blocks]
         if n_tail > 0:
             dst[r, sink_blocks : sink_blocks + n_tail] = block_table_tensor[
                 r, tail_start:nvb
             ]
-        capped[r] = sink_blocks * block_size + (total_kv - tail_start * block_size)
     return capped
 
 

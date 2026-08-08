@@ -28,7 +28,7 @@ G1..G4 — startup guards for configurations the SinkWindow port does not
       G3 KV connectors are rejected at config time;
       G4 every decoder attention layer must end up with SinkWindowSpec (model
          classes that override get_kv_cache_spec never see the flags).
-R1..R4 — the --streaming-kv-rebase-at config wall. Every check has both legs
+R1..R5 — the --streaming-kv-rebase-at config wall. Every check has both legs
       (fires on the bad config, inert on the good one and without the flag):
       R1 CacheConfig validator: rebase_at requires both streaming-kv flags,
          and rebase_at >= start_size + 2*recent_size (the single-rotation
@@ -41,7 +41,11 @@ R1..R4 — the --streaming-kv-rebase-at config wall. Every check has both legs
       R3 VllmConfig.validate_block_size: start_size % block_size == 0 in
          rebase mode, seated after the attention backend has finalised
          block_size (it may renegotiate the config-time value);
-      R4 CLI: --streaming-kv-rebase-at round-trip.
+      R4 CLI: --streaming-kv-rebase-at round-trip;
+      R5 VllmConfig.validate_streaming_kv fences on the other two M-RoPE
+         position stores/writers the rebase seats do not reach: the V2 model
+         runner (its own RopeState) and multimodal pruning (rewrites both
+         fields after the seats).
 """
 
 import argparse
@@ -53,6 +57,7 @@ import torch
 from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.config.cache import CacheConfig
 from vllm.config.kv_transfer import KVTransferConfig
+from vllm.config.multimodal import MultiModalConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
@@ -535,21 +540,25 @@ def test_rebase_at_threshold_error_shows_arithmetic():
 # ----------------------------------------------------------------------------
 # R2 — KV-dtype gate for rebase mode (VllmConfig.validate_streaming_kv seat)
 # ----------------------------------------------------------------------------
-def _fake_model_config(dtype=torch.bfloat16, quantization_config=None):
-    """Just the attributes the dtype gate reads; a real ModelConfig needs hub
+def _fake_model_config(
+    dtype=torch.bfloat16, quantization_config=None, multimodal_config=None
+):
+    """Just the attributes the rebase gates read; a real ModelConfig needs hub
     access. Mirrors resolve_kv_cache_dtype_string's hf_config traversal."""
     return SimpleNamespace(
         dtype=dtype,
         hf_config=SimpleNamespace(quantization_config=quantization_config),
+        multimodal_config=multimodal_config,
     )
 
 
-def _validate_streaming_kv(cache_config, model_config):
+def _validate_streaming_kv(cache_config, model_config, use_v2_model_runner=False):
     fake = SimpleNamespace(
         cache_config=cache_config,
         model_config=model_config,
         speculative_config=None,
         kv_transfer_config=None,
+        use_v2_model_runner=use_v2_model_runner,
     )
     return VllmConfig.validate_streaming_kv(fake)
 
@@ -638,6 +647,54 @@ def test_rebase_auto_dtype_without_model_config_skips():
     builds one before VllmConfig. The explicit-string leg still applies."""
     cfg = VllmConfig(cache_config=CacheConfig(**_REBASE_OK))
     assert cfg.cache_config.streaming_kv_rebase_at == 49152
+
+
+# ----------------------------------------------------------------------------
+# R5 — rebase-only fences on the two other M-RoPE position stores/writers
+# ----------------------------------------------------------------------------
+def test_rebase_rejects_v2_model_runner():
+    """The V2 runner keeps positions in its own RopeState, which neither
+    rebase seat updates. (Unbound-call idiom as above: forcing the real
+    `use_v2_model_runner` property on needs Triton, which CPU CI lacks.)"""
+    with pytest.raises(ValueError, match="V2 model runner"):
+        _validate_streaming_kv(
+            CacheConfig(**_REBASE_OK), _fake_model_config(), use_v2_model_runner=True
+        )
+
+
+def test_v2_model_runner_allowed_without_rebase():
+    """The V2 fence is rebase-only; plain streaming-kv is unchanged by it."""
+    cfg = _validate_streaming_kv(
+        CacheConfig(**_STREAMING_KV), _fake_model_config(), use_v2_model_runner=True
+    )
+    assert cfg.cache_config.streaming_kv_rebase_at is None
+
+
+def test_rebase_rejects_multimodal_pruning():
+    """EVS pruning rewrites both M-RoPE fields after the rebase seats."""
+    mm_config = MultiModalConfig(video_pruning_rate=0.5)
+    with pytest.raises(ValueError, match="multimodal pruning"):
+        _validate_streaming_kv(
+            CacheConfig(**_REBASE_OK),
+            _fake_model_config(multimodal_config=mm_config),
+        )
+
+
+@pytest.mark.parametrize("rate", [None, 0.0])
+def test_rebase_accepts_disabled_multimodal_pruning(rate):
+    cfg = _validate_streaming_kv(
+        CacheConfig(**_REBASE_OK),
+        _fake_model_config(multimodal_config=MultiModalConfig(video_pruning_rate=rate)),
+    )
+    assert cfg.cache_config.streaming_kv_rebase_at == 49152
+
+
+def test_multimodal_pruning_allowed_without_rebase():
+    cfg = _validate_streaming_kv(
+        CacheConfig(**_STREAMING_KV),
+        _fake_model_config(multimodal_config=MultiModalConfig(video_pruning_rate=0.5)),
+    )
+    assert cfg.cache_config.streaming_kv_rebase_at is None
 
 
 # ----------------------------------------------------------------------------

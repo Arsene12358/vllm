@@ -2378,6 +2378,37 @@ class VllmConfig:
         if self.cache_config.streaming_kv_rebase_at is not None:
             from vllm.utils.torch_utils import get_kv_cache_quant_algo_string
 
+            # The V2 model runner keeps M-RoPE positions in its own store
+            # (vllm/v1/worker/gpu/mm/rope.py: RopeState), which neither rebase
+            # seat touches — and SinkWindow itself was never ported to V2.
+            if self.use_v2_model_runner:
+                raise ValueError(
+                    "--streaming-kv-rebase-at is not supported by the V2 model "
+                    "runner: it stores M-RoPE positions in RopeState, which the "
+                    "rebase seats (V1 GPUModelRunner) do not update, so the "
+                    "session's positions would keep growing unbounded. Unset "
+                    "VLLM_USE_V2_MODEL_RUNNER (or drop "
+                    "--streaming-kv-rebase-at)."
+                )
+
+            # Multimodal pruning (EVS) is a second writer of both M-RoPE
+            # position fields, and it runs after the rebase seats: it would
+            # overwrite the rebased values with freshly recomputed raw ones.
+            mm_config = (
+                self.model_config.multimodal_config
+                if self.model_config is not None
+                else None
+            )
+            if mm_config is not None and mm_config.is_multimodal_pruning_enabled():
+                raise ValueError(
+                    "--streaming-kv-rebase-at is not supported together with "
+                    "multimodal pruning (--video-pruning-rate "
+                    f"{mm_config.video_pruning_rate}): pruning recomputes "
+                    "mrope_positions/mrope_position_delta after the rebase and "
+                    "would silently revert it. Set --video-pruning-rate 0 (or "
+                    "drop --streaming-kv-rebase-at)."
+                )
+
             rebase_dtype_msg = (
                 "--streaming-kv-rebase-at requires a bf16 or fp16 KV cache: "
                 "the rebase rotation stages in fp32 and writes back in the "
