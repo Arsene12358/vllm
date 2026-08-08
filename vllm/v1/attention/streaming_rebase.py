@@ -81,11 +81,11 @@ def _uniform_delta_cos_sin(
     """fp32 (cos, sin) of the uniform −Δ rotation at the module's actual
     frequencies.
 
-    Uses ``_compute_inv_freq`` (YaRN-aware) rather than ``cos_sin_cache``: the
-    cache is model-dtype (bf16 in production, too coarse for fp32 staging) and
-    bakes in the YaRN ``mscale`` magnitude factor, which is already applied to
-    the stored K and must not be applied twice — the delta step must be a pure
-    rotation.
+    Uses ``_compute_inv_freq(rotary.base)`` rather than ``cos_sin_cache`` (the
+    cache is model-dtype, too coarse for fp32 staging). Non-scaled rope only:
+    ``MRotaryEmbedding._compute_inv_freq`` forwards its argument to YaRN as the
+    SCALING FACTOR when ``scaling_factor`` is set, so a YaRN rotary would get
+    silently wrong frequencies here — ``rotate_kv_pages`` rejects it up front.
     """
     inv_freq = rotary._compute_inv_freq(rotary.base).to(
         device=device, dtype=torch.float32
@@ -115,17 +115,27 @@ def rotate_kv_pages(
             non-contiguous, written through in place.
         block_ids: Pages holding the logical stream: token ``t`` lives at
             ``key_cache[block_ids[t // block_size], t % block_size]``.
-        token_start: First logical token to rotate (e.g. S in a compacted row
-            whose ``block_ids`` include the sink blocks); may be mid-block.
-        token_end: One past the last logical token to rotate; the last block
-            may be partial.
+        token_start: First logical token to rotate; may be mid-block. NOTE for
+            compacted rows (``compute_sinkwindow_rows``): sinks are packed as
+            WHOLE blocks, so the recent tail starts at
+            ``cdiv(start_size, block_size) * block_size`` — pass THAT, not
+            ``start_size``; tokens in between are pinned near-prefix tokens.
+        token_end: One past the last logical token to rotate (``capped[r]``
+            for a compacted row); the last block may be partial.
         delta: Positions shift DOWN by this amount (``rebase_delta`` output).
-        rotary: The model's rotary module — supplies inv_freq (theta/YaRN),
+        rotary: The model's rotary module — supplies inv_freq (theta),
             rotary_dim, head_size and neox/gpt-j pairing. Never hardcoded.
+            Scaled-rope (YaRN) rotaries are rejected: see
+            ``_uniform_delta_cos_sin``.
         block_size: Tokens per page; must match ``key_cache.shape[1]``.
     """
     if delta == 0 or token_end <= token_start:
         return
+    assert getattr(rotary, "scaling_factor", None) is None, (
+        "streaming-kv rebase supports non-scaled rope only: MRotaryEmbedding."
+        "_compute_inv_freq dispatches its argument as the YaRN scaling factor, "
+        "so scaled-rope delta frequencies would be silently wrong"
+    )
     assert key_cache.dim() == 4 and key_cache.shape[1] == block_size, (
         f"expected [num_blocks, {block_size}, kv_heads, head_size] K view, "
         f"got {tuple(key_cache.shape)}"

@@ -25,6 +25,7 @@ targets (``pos + δ_old`` == ``pos − delta``) are unchanged.
 
 import contextlib
 
+import pytest
 import torch
 
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -379,24 +380,26 @@ def test_rebase_delta_arithmetic():
     assert base - delta == s  # post-rebase window front == S
 
 
-def test_sinks_untouched_token_start_honors_start_size():
-    """Full compacted-row layout with S mid-block: [0, S) bitwise intact,
+def test_sinks_untouched_token_start_honors_sink_block_boundary():
+    """Realistic compacted row (block-aligned S, the validated production
+    shape): compute_sinkwindow_rows packs sinks as whole blocks and the recent
+    tail starts at slot ``sink_blocks * block_size``. [0, S) bitwise intact,
     [S, end) rotated to the reference; unwritten tail slots intact."""
     torch.manual_seed(21)
     with _config_ctx():
         rope = _make_rope()
-        s, n_recent = 24, 36  # S mid-block; 60 tokens over 4 blocks (partial)
+        s, n_recent = 32, 36  # S = 2 whole sink blocks; 68 tokens, partial tail
         n = s + n_recent
         base = 200
-        delta = rebase_delta(base, s)  # 176
+        delta = rebase_delta(base, s)  # 168
         pos_sink = torch.arange(s, dtype=torch.long)
         pos_recent = base + torch.arange(n_recent, dtype=torch.long)
         pos = torch.cat([pos_sink, pos_recent])
         k_raw = torch.randn(n, NUM_KV_HEADS * HEAD_DIM, dtype=torch.float32)
         k_stored = _rotate_k(rope, pos, k_raw)
 
-        _, key_cache, _ = _make_packed_cache(6, torch.float32)
-        block_ids = [1, 4, 2, 5]  # compacted row: sink blocks ++ tail blocks
+        _, key_cache, _ = _make_packed_cache(8, torch.float32)
+        block_ids = [1, 4, 2, 5, 7]  # compacted row: sink blocks ++ tail blocks
         _scatter_tokens(key_cache, block_ids, 0, k_stored)
         before = _gather_tokens(key_cache, block_ids, 0, n)
 
@@ -409,6 +412,44 @@ def test_sinks_untouched_token_start_honors_start_size():
     assert err < 1e-4, f"recent window != reference; err={err}"
     # The rebased window's effective positions start exactly at S.
     assert int((pos_recent - delta).min()) == s
+
+
+def test_non_aligned_start_size_slack_tokens_protected():
+    """Non-block-aligned start_size: sinks are packed as WHOLE blocks, so the
+    compacted-row rotation boundary is cdiv(start_size, bs) * bs — the slack
+    tokens in [start_size, boundary) are pinned near-prefix tokens and must
+    survive the rebase bitwise (rotating them by −Δ would corrupt them)."""
+    torch.manual_seed(23)
+    with _config_ctx():
+        rope = _make_rope()
+        start_size, n_recent = 24, 28
+        boundary = -(-start_size // BLOCK_SIZE) * BLOCK_SIZE  # cdiv * bs = 32
+        n = boundary + n_recent  # 60 tokens over 4 blocks (partial tail)
+        base = 200
+        delta = rebase_delta(base, start_size)  # 176
+        # Pinned prefix occupies its whole blocks: positions 0..boundary-1
+        # (sinks [0, start_size) AND slack [start_size, boundary)).
+        pos_prefix = torch.arange(boundary, dtype=torch.long)
+        pos_recent = base + torch.arange(n_recent, dtype=torch.long)
+        pos = torch.cat([pos_prefix, pos_recent])
+        k_raw = torch.randn(n, NUM_KV_HEADS * HEAD_DIM, dtype=torch.float32)
+        k_stored = _rotate_k(rope, pos, k_raw)
+
+        _, key_cache, _ = _make_packed_cache(6, torch.float32)
+        block_ids = [3, 0, 5, 2]
+        _scatter_tokens(key_cache, block_ids, 0, k_stored)
+        before = _gather_tokens(key_cache, block_ids, 0, n)
+
+        rotate_kv_pages(key_cache, block_ids, boundary, n, delta, rope, BLOCK_SIZE)
+
+        got = _gather_tokens(key_cache, block_ids, 0, n)
+        want = rotate_flat_reference(k_stored[boundary:], pos_recent, delta, rope)
+    assert torch.equal(got[:start_size], before[:start_size]), "sinks rotated"
+    assert torch.equal(got[start_size:boundary], before[start_size:boundary]), (
+        "slack tokens in [start_size, sink-block boundary) were rotated"
+    )
+    err = (got[boundary:] - want).abs().max().item()
+    assert err < 1e-4, f"recent window != reference; err={err}"
 
 
 def test_zero_delta_is_a_bitwise_noop():
@@ -430,15 +471,49 @@ def test_zero_delta_is_a_bitwise_noop():
     assert torch.equal(kv, snap)
 
 
+def test_yarn_scaled_rotary_rejected():
+    """``MRotaryEmbedding._compute_inv_freq`` forwards its argument to YaRN as
+    the SCALING FACTOR (not the base), so a scaled-rope rotary would silently
+    get wrong delta frequencies. The module must fail loudly, before any cache
+    mutation, instead of corrupting K."""
+    torch.manual_seed(24)
+    with _config_ctx():
+        rope = MRotaryEmbedding(
+            head_size=HEAD_DIM,
+            rotary_dim=ROTARY_DIM,
+            max_position_embeddings=1024,
+            base=ROPE_THETA,
+            is_neox_style=True,
+            dtype=torch.float32,
+            mrope_section=MROPE_SECTION,
+            mrope_interleaved=True,
+            scaling_factor=4.0,
+        )
+        kv, key_cache, _ = _make_packed_cache(4, torch.bfloat16)
+        snap = kv.clone()
+        with pytest.raises(AssertionError, match="non-scaled rope"):
+            rotate_kv_pages(key_cache, [0, 1], 0, 20, 50, rope, BLOCK_SIZE)
+    assert torch.equal(kv, snap)  # rejected before any cache mutation
+
+
 # --------------------------------------------------------------------------
 # (e) bf16 write-back single-rotation error bound.
 # --------------------------------------------------------------------------
 def test_bf16_writeback_single_rotation_error_bound():
-    """One fp32-staged rotation on a bf16 cache stays within 2x the bf16
-    storage floor (measured in-test, the way the prior-art suite measured its
-    fp32 floor). This is the numerical content of the single-rotation
-    invariant: each K entry is rotated at most once before eviction, so the
-    write-back rounding never compounds."""
+    """One fp32-staged rotation on a bf16 cache stays within the bf16 storage
+    floor (measured in-test, the way the prior-art suite measured its fp32
+    floor). This is the numerical content of the single-rotation invariant:
+    each K entry is rotated at most once before eviction, so the write-back
+    rounding never compounds.
+
+    Two bounds, because unitarity constrains L2, not max: the rotation
+    preserves the L2 norm of the pre-existing input-rounding error exactly and
+    the write-back adds one fresh rounding of the same scale, so the RMS error
+    is genuinely <= 2x the RMS storage floor (measured ~1.33x, stable across
+    seeds 0-11). The max-metric worst case for round -> unitary-rotate ->
+    round is (1 + sqrt(2)) * floor ~= 2.41x when the errors align, plus
+    max-statistics scatter (measured up to 2.65x across seeds 0-11) — bounded
+    at 3x as a coarse guard."""
     torch.manual_seed(4)
     with _config_ctx():
         rope = _make_rope()
@@ -452,12 +527,22 @@ def test_bf16_writeback_single_rotation_error_bound():
         got = _paged_rotate(k_stored, delta, rope, dtype=torch.bfloat16)
 
         # The unavoidable bf16 storage floor the cache already carries.
-        floor = (k_stored.to(torch.bfloat16).float() - k_stored).abs().max().item()
-        err = (got.float() - k_target).abs().max().item()
+        floor_vec = k_stored.to(torch.bfloat16).float() - k_stored
+        err_vec = got.float() - k_target
+        floor_max = floor_vec.abs().max().item()
+        err_max = err_vec.abs().max().item()
+        floor_rms = floor_vec.pow(2).mean().sqrt().item()
+        err_rms = err_vec.pow(2).mean().sqrt().item()
     print(
-        f"[bf16] single-rotation err={err:.3e} storage floor={floor:.3e} "
-        f"ratio={err / floor:.2f}"
+        f"[bf16] single-rotation rms={err_rms:.3e} (floor {floor_rms:.3e}, "
+        f"ratio {err_rms / floor_rms:.2f}) max={err_max:.3e} "
+        f"(floor {floor_max:.3e}, ratio {err_max / floor_max:.2f})"
     )
-    assert err <= 2 * floor, (
-        f"bf16 single-rotation error {err} exceeds 2x storage floor {floor}"
+    assert err_rms <= 2 * floor_rms, (
+        f"bf16 single-rotation RMS error {err_rms} exceeds 2x the RMS "
+        f"storage floor {floor_rms}"
+    )
+    assert err_max <= 3 * floor_max, (
+        f"bf16 single-rotation max error {err_max} exceeds 3x the max "
+        f"storage floor {floor_max}"
     )
