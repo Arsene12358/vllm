@@ -18,8 +18,10 @@ import torch
 
 from tests.v1.core.utils import create_scheduler
 from vllm.model_executor.layers.utils import apply_penalties
-from vllm.sampling_params import SamplingParams
-from vllm.v1.request import Request, StreamingUpdate
+from vllm.sampling_params import RepetitionDetectionParams, SamplingParams
+from vllm.v1.engine import FinishReason
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
 VOCAB_SIZE = 8
 PROMPT_ONLY_TOKEN = 3
@@ -121,3 +123,89 @@ def test_session_append_folds_output_into_prompt_and_clears_output_ids():
     assert list(session.prompt_token_ids) == [1, 2, 3, 41, 42, 9]
     # ...and the output ids reset, so frequency/presence start from scratch.
     assert list(session.output_token_ids) == []
+
+
+# ---------------------------------------------------------------------------
+# repetition_detection: the output-scoped anti-loop guard a forever-request
+# uses INSTEAD of repetition_penalty. Pin that it survives a session append,
+# is scored over the current chunk's output only, and leaves the session alive.
+# ---------------------------------------------------------------------------
+
+LOOP_TOKEN = 42
+_DETECTION = RepetitionDetectionParams(
+    min_pattern_size=1, max_pattern_size=4, min_count=4
+)
+
+
+def _detecting_chunk(prompt_token_ids: list[int], max_tokens: int) -> Request:
+    return Request(
+        request_id="session",
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=SamplingParams(
+            max_tokens=max_tokens, repetition_detection=_DETECTION
+        ),
+        pooling_params=None,
+        resumable=True,
+    )
+
+
+def _step_sampling(scheduler, token_id: int) -> list:
+    """One engine step in which every scheduled request samples `token_id`."""
+    scheduler_output = scheduler.schedule()
+    req_ids = list(scheduler_output.num_scheduled_tokens)
+    model_output = ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        sampled_token_ids=[[token_id] for _ in req_ids],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    engine_core_outputs = scheduler.update_from_output(scheduler_output, model_output)
+    return [o for eco in engine_core_outputs.values() for o in eco.outputs]
+
+
+def test_repetition_detection_is_scored_per_chunk_and_keeps_the_session_alive():
+    scheduler = create_scheduler()
+    session = _detecting_chunk([1, 2, 3], max_tokens=32)
+    scheduler.add_request(session)
+
+    # Two identical tokens in the first chunk: short of min_count=4.
+    for _ in range(2):
+        _step_sampling(scheduler, LOOP_TOKEN)
+    assert list(session.output_token_ids) == [LOOP_TOKEN] * 2
+    assert not session.is_finished()
+
+    # Append a query chunk that itself carries loop tokens. The computed loop
+    # token folds into the prompt and the output ids reset, so the request's
+    # token state now ENDS in four consecutive loop tokens while its output is
+    # empty: a detector scored over the whole token state would trip on the very
+    # next sampled token, an output-scoped one needs four more.
+    update = StreamingUpdate.from_request(
+        _detecting_chunk([LOOP_TOKEN] * 3, max_tokens=32)
+    )
+    assert update is not None
+    scheduler._update_request_as_session(session, update)
+    assert list(session.prompt_token_ids)[-4:] == [LOOP_TOKEN] * 4
+    assert list(session.output_token_ids) == []
+    assert session.sampling_params.repetition_detection == _DETECTION
+
+    # If the folded history counted, this would trip on the very first token.
+    outputs = []
+    for _ in range(3):
+        outputs = _step_sampling(scheduler, LOOP_TOKEN)
+        assert not any(o.finish_reason is not None for o in outputs)
+    assert list(session.output_token_ids) == [LOOP_TOKEN] * 3
+
+    # The fourth repeat inside THIS chunk trips it.
+    outputs = _step_sampling(scheduler, LOOP_TOKEN)
+    finished = [o for o in outputs if o.finish_reason is not None]
+    assert len(finished) == 1
+    assert finished[0].finish_reason == FinishReason.REPETITION
+    assert finished[0].stop_reason == "repetition_detected"
+
+    # The degenerate answer ended, but the SESSION survives: still owned by the
+    # scheduler and parked waiting for the next input chunk.
+    assert "session" in scheduler.requests
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert not session.is_finished()

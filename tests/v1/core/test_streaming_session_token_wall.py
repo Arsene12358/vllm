@@ -11,6 +11,8 @@ per-request error instead: the append is rejected, the session finishes with
 FinishReason.ERROR, and the engine keeps serving.
 """
 
+import logging
+
 import pytest
 
 from tests.v1.core.utils import create_scheduler
@@ -31,7 +33,17 @@ def _session_chunk(prompt_token_ids: list[int], max_tokens: int = 1) -> Request:
 
 
 def _step(scheduler) -> dict:
-    """Run one schedule/execute/update cycle, sampling one token per request."""
+    """Run one schedule/execute/update cycle, sampling one token per request.
+
+    Mirrors EngineCore.step, INCLUDING its `has_requests()` early return: a
+    rejection that leaves the session excluded from the unfinished count would
+    stop the engine stepping and never reach update_from_output, so the gate has
+    to be part of every test's step or the hang is invisible.
+    """
+    assert scheduler.has_requests(), (
+        "engine would stop stepping here: has_requests() is False while a "
+        "request is still owned by the scheduler"
+    )
     scheduler_output = scheduler.schedule()
     req_ids = list(scheduler_output.num_scheduled_tokens)
     model_output = ModelRunnerOutput(
@@ -42,7 +54,12 @@ def _step(scheduler) -> dict:
         prompt_logprobs_dict={},
         pooler_output=[],
     )
+    _LAST_SCHEDULED.clear()
+    _LAST_SCHEDULED.extend(req_ids)
     return scheduler.update_from_output(scheduler_output, model_output)
+
+
+_LAST_SCHEDULED: list[str] = []
 
 
 def _idle_session(scheduler) -> Request:
@@ -72,6 +89,14 @@ def test_session_append_past_max_model_len_fails_only_the_request():
     assert list(session.prompt_token_ids) == prompt_before
     assert session.num_computed_tokens == computed_before
     assert scheduler.streaming_overflow_error_reqs == {"session"}
+
+    # The session stays parked (a blocked status, so nothing schedules it), but
+    # the engine must still consider itself to have work, or step() returns
+    # before update_from_output can finish the request and the session hangs.
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert scheduler.num_waiting_for_streaming_input == 1
+    assert scheduler.get_num_unfinished_requests() == 1
+    assert scheduler.has_requests()
 
     # The next engine step finishes just that request, with an error naming the
     # limit -- no exception escapes to kill the EngineCore.
@@ -122,6 +147,58 @@ def test_queued_overflow_append_parks_then_errors_the_session():
     # The engine keeps serving: a fresh request still schedules normally.
     scheduler.add_request(_session_chunk([1, 2, 3]))
     assert _step(scheduler) is not None
+
+
+def test_rejected_idle_session_keeps_the_engine_stepping_to_its_error():
+    """The dominant path at a paced frame rate: chunks arrive while the session
+    is parked, so add_request rejects. EngineCore.step() early-returns unless
+    has_requests() stays True, so drive the whole loop the way step() does and
+    assert the session is never scheduled, never hangs, and ends in an error."""
+    scheduler = create_scheduler()
+    session = _idle_session(scheduler)
+    limit = scheduler.max_model_len
+
+    update = StreamingUpdate.from_request(_session_chunk(list(range(limit))))
+    assert update is not None
+    scheduler._update_request_as_session(session, update)
+
+    errored = []
+    for _ in range(4):  # each iteration asserts has_requests() inside _step
+        engine_core_outputs = _step(scheduler)
+        assert "session" not in _LAST_SCHEDULED  # parked, never scheduled
+        errored += [
+            o
+            for eco in engine_core_outputs.values()
+            for o in eco.outputs
+            if o.request_id == "session"
+        ]
+        assert scheduler.num_waiting_for_streaming_input >= 0  # no double decrement
+        if "session" not in scheduler.requests:
+            break
+
+    assert len(errored) == 1
+    assert errored[0].finish_reason == FinishReason.ERROR
+    assert "max_model_len" in errored[0].stop_reason
+    assert scheduler.num_waiting_for_streaming_input == 0
+    # One more step flushes the finished id, then the engine quiesces cleanly
+    # instead of spinning on a phantom request.
+    _step(scheduler)
+    assert not scheduler.has_requests()
+
+
+def test_rejection_is_logged_once_per_session(caplog):
+    """A paced source keeps sending chunks; the reason must not be re-logged."""
+    scheduler = create_scheduler()
+    session = _idle_session(scheduler)
+    limit = scheduler.max_model_len
+
+    with caplog.at_level(logging.ERROR):
+        for _ in range(3):
+            update = StreamingUpdate.from_request(_session_chunk(list(range(limit))))
+            assert update is not None
+            scheduler._update_request_as_session(session, update)
+
+    assert sum("max_model_len" in r.getMessage() for r in caplog.records) == 1
 
 
 def test_session_append_within_max_model_len_still_appends():

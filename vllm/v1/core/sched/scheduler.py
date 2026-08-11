@@ -1296,7 +1296,7 @@ class Scheduler(SchedulerInterface):
         Discards the last sampled output token from the prior input chunk.
 
         An append that would push the session past max_model_len is rejected:
-        the session is left untouched and recorded in
+        the session is left untouched and parked, recorded in
         `streaming_overflow_error_reqs`, and `update_from_output` finishes it
         with `FinishReason.ERROR`.
         """
@@ -1322,11 +1322,19 @@ class Scheduler(SchedulerInterface):
                 f"every chunk in the request's token state, so a long-lived "
                 f"session must be served with a larger --max-model-len."
             )
-            logger.error("Request %s: %s", session.request_id, reason)
+            if session.request_id not in self.streaming_overflow_error_reqs:
+                logger.error("Request %s: %s", session.request_id, reason)
             session.stop_reason = reason
             session.resumable = False
             if session.streaming_queue is not None:
                 session.streaming_queue.clear()
+            # The session stays parked in WAITING_FOR_STREAMING_REQ (a blocked
+            # waiting status, so nothing schedules it in the window before it is
+            # finished) and its counter entry is left alone, so finish_requests
+            # decrements it exactly once. get_num_unfinished_requests adds these
+            # back, since a session awaiting its error is work, not an idle
+            # session -- without that, has_requests() goes False and
+            # EngineCore.step() returns before update_from_output can finish it.
             self.streaming_overflow_error_reqs.add(session.request_id)
             return
 
@@ -2042,8 +2050,10 @@ class Scheduler(SchedulerInterface):
                 # Streaming request finished.
                 return True
             self._update_request_as_session(request, update)
-            # A rejected append (max_model_len) parks the session exactly like
-            # an idle one, so update_from_output can finish it with an error.
+            # A rejected append parks the session exactly like an idle one, so
+            # nothing schedules it before update_from_output finishes it with an
+            # error. Read the rejection off the set rather than a return value:
+            # subclasses override _update_request_as_session and return None.
             park_for_input = request.request_id in self.streaming_overflow_error_reqs
         if park_for_input:
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
@@ -2344,6 +2354,11 @@ class Scheduler(SchedulerInterface):
             len(self.waiting)
             + len(self.skipped_waiting)
             - self.num_waiting_for_streaming_input
+            # A session whose append was rejected is still parked (and so still
+            # counted in num_waiting_for_streaming_input), but it is pending
+            # work, not idle: update_from_output has yet to finish it with an
+            # error. Excluding it would stop EngineCore stepping and hang it.
+            + len(self.streaming_overflow_error_reqs)
         )
         return num_waiting + len(self.running)
 
