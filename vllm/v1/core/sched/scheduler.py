@@ -206,6 +206,10 @@ class Scheduler(SchedulerInterface):
         # update_from_output.
         self.grammar_compile_error_reqs: set[str] = set()
 
+        # Streaming sessions whose next input chunk would push the request past
+        # max_model_len, to finish as per-request errors in update_from_output.
+        self.streaming_overflow_error_reqs: set[str] = set()
+
         # Encoder-related.
         # Calculate encoder cache size if applicable
         supports_mm_inputs = mm_registry.supports_multimodal_inputs(
@@ -1290,11 +1294,42 @@ class Scheduler(SchedulerInterface):
         Updates the waiting session with the next streaming update.
 
         Discards the last sampled output token from the prior input chunk.
+
+        An append that would push the session past max_model_len is rejected:
+        the session is left untouched and recorded in
+        `streaming_overflow_error_reqs`, and `update_from_output` finishes it
+        with `FinishReason.ERROR`.
         """
 
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
         num_computed_tokens = session.num_computed_tokens
+
+        # A session's prompt grows without bound: every append folds the prior
+        # chunk's computed output into the prompt and then extends it, so the
+        # folded prompt is exactly num_computed_tokens long. Nothing downstream
+        # re-validates that length (InputProcessor only sees the chunk), and
+        # the model runner's token_ids_cpu row is max_model_len wide — so an
+        # overflowing append used to take the whole EngineCore down instead of
+        # failing the one request. Reject it here, leaving room for at least
+        # one sampled token.
+        new_prompt_len = num_computed_tokens + len(update.prompt_token_ids or ())
+        if new_prompt_len >= self.max_model_len:
+            reason = (
+                f"streaming session input chunk rejected: the session prompt "
+                f"would reach {new_prompt_len} tokens, at or past this engine's "
+                f"max_model_len of {self.max_model_len}. Streaming sessions keep "
+                f"every chunk in the request's token state, so a long-lived "
+                f"session must be served with a larger --max-model-len."
+            )
+            logger.error("Request %s: %s", session.request_id, reason)
+            session.stop_reason = reason
+            session.resumable = False
+            if session.streaming_queue is not None:
+                session.streaming_queue.clear()
+            self.streaming_overflow_error_reqs.add(session.request_id)
+            return
+
         kept_output_tokens = session._all_token_ids[
             session.num_prompt_tokens : num_computed_tokens
         ]
@@ -1872,6 +1907,8 @@ class Scheduler(SchedulerInterface):
 
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()
+        error_req_ids.update(self.streaming_overflow_error_reqs)
+        self.streaming_overflow_error_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
 
@@ -1885,6 +1922,7 @@ class Scheduler(SchedulerInterface):
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
+                        stop_reason=request.stop_reason,
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
                     )
@@ -1997,13 +2035,17 @@ class Scheduler(SchedulerInterface):
         if not request.resumable:
             return True
 
+        park_for_input = True
         if request.streaming_queue:
             update = request.streaming_queue.popleft()
             if update is None:
                 # Streaming request finished.
                 return True
             self._update_request_as_session(request, update)
-        else:
+            # A rejected append (max_model_len) parks the session exactly like
+            # an idle one, so update_from_output can finish it with an error.
+            park_for_input = request.request_id in self.streaming_overflow_error_reqs
+        if park_for_input:
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
             self.num_waiting_for_streaming_input += 1
 
