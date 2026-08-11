@@ -186,6 +186,42 @@ def test_rejected_idle_session_keeps_the_engine_stepping_to_its_error():
     assert not scheduler.has_requests()
 
 
+def test_a_later_fitting_chunk_cannot_revive_a_rejected_session():
+    """Rejection must be sticky. Chunk sizes vary -- a query chunk is far
+    smaller than a frame chunk -- so a later append can still fit under the
+    limit. Applying it would un-park the session, let it be scheduled, and
+    finish it as LENGTH_CAPPED before the error drain, clearing the set with no
+    error output and leaving the next chunk to open a brand-new empty-prompt
+    session under the same id: a silent context reset."""
+    scheduler = create_scheduler()
+    session = _idle_session(scheduler)
+    limit = scheduler.max_model_len
+
+    scheduler._update_request_as_session(
+        session, StreamingUpdate.from_request(_session_chunk(list(range(limit))))
+    )
+    assert scheduler.streaming_overflow_error_reqs == {"session"}
+    prompt_after_rejection = list(session.prompt_token_ids)
+
+    # A small chunk that comfortably fits must be ignored, not applied.
+    scheduler._update_request_as_session(
+        session, StreamingUpdate.from_request(_session_chunk([1, 2, 3]))
+    )
+    assert list(session.prompt_token_ids) == prompt_after_rejection
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert scheduler.num_waiting_for_streaming_input == 1  # still parked, once
+    assert scheduler.streaming_overflow_error_reqs == {"session"}
+
+    engine_core_outputs = _step(scheduler)
+    assert "session" not in _LAST_SCHEDULED  # never revived into scheduling
+    outputs = [o for eco in engine_core_outputs.values() for o in eco.outputs]
+    errored = [o for o in outputs if o.request_id == "session"]
+    assert len(errored) == 1
+    assert errored[0].finish_reason == FinishReason.ERROR
+    assert "max_model_len" in errored[0].stop_reason
+    assert scheduler.num_waiting_for_streaming_input == 0
+
+
 def test_rejection_is_logged_once_per_session(caplog):
     """A paced source keeps sending chunks; the reason must not be re-logged."""
     scheduler = create_scheduler()

@@ -1298,8 +1298,19 @@ class Scheduler(SchedulerInterface):
         An append that would push the session past max_model_len is rejected:
         the session is left untouched and parked, recorded in
         `streaming_overflow_error_reqs`, and `update_from_output` finishes it
-        with `FinishReason.ERROR`.
+        with `FinishReason.ERROR`. The rejection is sticky, so a later chunk
+        that happens to fit cannot revive a session that is already dead.
         """
+
+        # Rejection is terminal. Chunk sizes vary (a query chunk is far smaller
+        # than a frame chunk), so a later append can still fit under the limit;
+        # applying it would un-park the session, let it be scheduled, and finish
+        # it as FINISHED_LENGTH_CAPPED before the error drain runs -- clearing
+        # the set with no error output, and leaving the next chunk to open a
+        # brand-new empty-prompt session under the same id (a silent context
+        # reset). Ignore every append until the drain finishes the session.
+        if session.request_id in self.streaming_overflow_error_reqs:
+            return
 
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
