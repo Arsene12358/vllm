@@ -111,13 +111,18 @@ class CacheConfig:
     entry is rotated at most once before eviction claims it).
 
     It must also sit BELOW the model's trained position range (the rotary
-    table's `max_position_embeddings`) with headroom: the event fires once the
-    recent window's front is within `recent_size` of this threshold, and the
-    scheduler step that trips it can still append a whole chunk before the
-    rotation lands, so peak effective positions overshoot the threshold by up
-    to one chunk's position span (bounded by `max_num_batched_tokens`).
-    Startup warns when `rebase_at + max_num_batched_tokens` exceeds the
-    trained range."""
+    table's `max_position_embeddings`): rebase_at is the ceiling effective
+    positions are then held under, so at or above that range they are not
+    bounded by it at all, and startup warns in full. Peak positions do
+    overshoot the threshold slightly — the event fires once the recent
+    window's front is within `recent_size` of it, and the scheduler step that
+    trips it can still append a whole chunk before the rotation lands — but
+    only by that chunk's POSITION span, for which
+    `max_num_batched_tokens` is a loose token-count upper bound: measured
+    peak was `rebase_at + 2` on the validated production geometry (49152,
+    2 fps video at ~0.095 positions/token). Startup also warns when
+    `rebase_at + max_num_batched_tokens` exceeds the trained range, saying
+    how to check the real peak from the rebase log."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"

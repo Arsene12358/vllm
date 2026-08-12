@@ -49,9 +49,12 @@ R1..R5 — the --streaming-kv-rebase-at config wall. Every check has both legs
       R6 VllmConfig.validate_streaming_kv rejects scaled-rope (YaRN) M-RoPE
          checkpoints, whose rotary would give the rotation silently wrong
          delta frequencies (rotate_kv_pages' assert strips under -O);
-      R7 VllmConfig.validate_streaming_kv WARNS when rebase_at leaves less
-         than one scheduler step of headroom below the model's trained
-         position range.
+      R7 VllmConfig.validate_streaming_kv WARNS about rebase_at vs the
+         model's trained position range, in two tiers: in full when rebase_at
+         is at or above the range (positions genuinely unbounded by it), and
+         in a verify-this tone when only the token-count headroom bound
+         breaches (it over-estimates ~10x for M-RoPE video, and the shipped
+         production config lands there).
 """
 
 import argparse
@@ -798,30 +801,59 @@ def _warnings_from_validate(**kwargs) -> list[str]:
     ]
 
 
-def test_rebase_at_shipped_geometry_does_not_warn():
-    """The shipped demo geometry: rebase_at 49152 + one 16384-token step lands
-    exactly on the 65536 trained range, so it clears the bound."""
-    assert (
-        _warnings_from_validate(
-            cache_config=CacheConfig(**_REBASE_OK),
-            model_config=_fake_model_config(max_position_embeddings=65536),
-            max_num_batched_tokens=16384,
-        )
-        == []
+@pytest.mark.parametrize("max_position_embeddings", [49152, 32768])
+def test_rebase_at_at_or_above_trained_range_warns(max_position_embeddings):
+    """rebase_at is the ceiling effective positions are held under, so at or
+    above the trained range they are not bounded by it at all — the one
+    unambiguous breach, warned in full."""
+    msgs = _warnings_from_validate(
+        cache_config=CacheConfig(**_REBASE_OK),
+        model_config=_fake_model_config(
+            max_position_embeddings=max_position_embeddings
+        ),
+        max_num_batched_tokens=32768,
     )
+    assert len(msgs) == 1
+    assert "at or above" in msgs[0]
+    assert "49152" in msgs[0] and str(max_position_embeddings) in msgs[0]
+    # Not the softened token-bound text: this case needs no verification.
+    assert "0.095" not in msgs[0]
 
 
-def test_rebase_at_without_a_step_of_headroom_warns():
-    """One scheduler step can append a whole chunk after the trigger fires, so
-    positions can overshoot the trained range before the rotation lands."""
+def test_rebase_at_shipped_geometry_warns_only_about_the_token_bound():
+    """The soak-validated production config — rebase_at 49152 under a 65536
+    trained range, with the thinker stage's shipped max_num_batched_tokens
+    32768 (vllm_omni/deploy/qwen3_omni_moe.yaml). 49152 + 32768 breaches the
+    token-count bound, so it warns, but the bound over-estimates ~10x for
+    M-RoPE video: measured peak was 49154, i.e. 2 positions past rebase_at.
+    The message must therefore read as "verify", not "your config is wrong"."""
     msgs = _warnings_from_validate(
         cache_config=CacheConfig(**_REBASE_OK),
         model_config=_fake_model_config(max_position_embeddings=65536),
         max_num_batched_tokens=32768,
     )
     assert len(msgs) == 1
-    # Names the offending numbers and the remedy ceiling (65536 - 32768).
     assert "49152" in msgs[0] and "65536" in msgs[0] and "32768" in msgs[0]
+    # Says the headroom term is a token-count upper bound, how far off it is
+    # for M-RoPE video, and how to read the real peak off the rebase log.
+    assert "UPPER BOUND" in msgs[0] and "TOKENS" in msgs[0]
+    assert "0.095" in msgs[0]
+    assert "new_base" in msgs[0]
+    # Conditional remedy, not a prescription; and not the strong tier.
+    assert "only if" in msgs[0]
+    assert "at or above" not in msgs[0]
+
+
+def test_rebase_at_within_the_token_bound_does_not_warn():
+    """Even the loose token-count bound cleared -> silence."""
+    assert (
+        _warnings_from_validate(
+            cache_config=CacheConfig(**{**_REBASE_OK, "streaming_kv_rebase_at": 16384}),
+            model_config=_fake_model_config(max_position_embeddings=65536),
+            max_num_batched_tokens=32768,
+        )
+        == []
+    )
 
 
 def test_rebase_at_upper_bound_warning_is_rebase_only():

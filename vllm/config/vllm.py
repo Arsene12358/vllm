@@ -2446,13 +2446,17 @@ class VllmConfig:
                         "rotates cached K)."
                     )
 
-            # Upper bound on rebase_at. The trigger fires when the recent
-            # window's FRONT is within recent_size of rebase_at, so effective
-            # positions peak just past rebase_at — plus whatever one more
-            # scheduler step appends before the rotation lands (bounded by
-            # max_num_batched_tokens). Past the rotary table's trained range
-            # the frequencies are extrapolated, so warn (not reject: the table
-            # is built long enough, and short overshoots are survivable).
+            # Upper bound on rebase_at, in two tiers. rebase_at is the ceiling
+            # the rebase holds effective positions under, so rebase_at at or
+            # above the trained range means positions are simply not bounded
+            # by it — unambiguous, warn in full. The softer tier adds one
+            # scheduler step: the trigger fires when the recent window's FRONT
+            # is within recent_size of rebase_at and the step that trips it can
+            # append a whole chunk before the rotation lands. That term is a
+            # TOKEN-COUNT bound (one position per token); M-RoPE video runs an
+            # order of magnitude below it, so it over-estimates rather than
+            # detects, and the message says so. Warn, never reject: the rotary
+            # table is built long enough and short overshoots are survivable.
             max_position_embeddings = getattr(
                 hf_text_cfg, "max_position_embeddings", None
             )
@@ -2460,23 +2464,43 @@ class VllmConfig:
             rebase_at = self.cache_config.streaming_kv_rebase_at
             if (
                 max_position_embeddings is not None
+                and rebase_at >= max_position_embeddings
+            ):
+                logger.warning(
+                    "--streaming-kv-rebase-at %d is at or above this model's "
+                    "trained position range (max_position_embeddings %d): "
+                    "rebase_at is the ceiling effective positions are held "
+                    "under, so a long enough stream runs past the trained "
+                    "range and its rotary frequencies are extrapolated there. "
+                    "Lower --streaming-kv-rebase-at below %d.",
+                    rebase_at,
+                    max_position_embeddings,
+                    max_position_embeddings,
+                )
+            elif (
+                max_position_embeddings is not None
                 and step_tokens is not None
                 and rebase_at + step_tokens > max_position_embeddings
             ):
                 logger.warning(
-                    "--streaming-kv-rebase-at %d leaves less than one "
-                    "scheduler step of headroom below this model's trained "
-                    "position range (max_position_embeddings %d, "
-                    "max_num_batched_tokens %d): a rebase event fires at "
-                    "rebase_at - streaming_kv_recent_size but the step that "
-                    "trips it can still append a whole chunk, so effective "
-                    "positions can overshoot the trained range before the "
-                    "rotation lands. Lower --streaming-kv-rebase-at to at "
-                    "most %d.",
+                    "--streaming-kv-rebase-at %d plus one scheduler step "
+                    "(max_num_batched_tokens %d) exceeds this model's trained "
+                    "position range (max_position_embeddings %d). That sum is "
+                    "an UPPER BOUND counted in TOKENS, not a measurement: it "
+                    "charges one position per token for the chunk a step can "
+                    "append after the trigger fires. Multimodal M-RoPE streams "
+                    "advance far slower (~0.095 positions/token measured on "
+                    "2 fps video, so the bound over-estimates ~10x) and "
+                    "usually stay inside the range. Verify rather than "
+                    "re-tune: every rebase logs '[streaming-kv] rebase ... "
+                    "delta=D new_base=B recent_tokens=T', and B + D + T bounds "
+                    "the peak effective position that rotation reached. Lower "
+                    "--streaming-kv-rebase-at only if that figure approaches "
+                    "%d.",
                     rebase_at,
-                    max_position_embeddings,
                     step_tokens,
-                    max_position_embeddings - step_tokens,
+                    max_position_embeddings,
+                    max_position_embeddings,
                 )
 
             rebase_dtype_msg = (
