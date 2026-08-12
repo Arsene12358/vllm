@@ -356,8 +356,13 @@ def maybe_rebase_request(
             (``kv_cache.transpose(1, 2).split(head_size, dim=-1)[0]``). Layers
             share positions, so one Δ applies to all of them, but each layer
             owns its own K.
-        block_ids: The request's LOGICAL block-table row for that group
-            (evicted middle blocks still present as nulls).
+        block_ids: The request's LOGICAL block-table row for that group. The
+            runner's copy only ever gets APPENDED to (``block_ids.extend``),
+            so the evicted middle entries are the STALE REAL ids of blocks the
+            manager already freed (and the pool may have handed to someone
+            else) — not nulls. Never address them: the rotation only ever
+            touches the sink prefix and the alive tail, both taken from
+            ``sinkwindow_row_geometry``.
         kv_cache_spec: The group's spec. Anything but ``SinkWindowSpec`` is a
             no-op — the gate is the spec, never ``uses_mrope``.
         rebase_at: ``--streaming-kv-rebase-at``.

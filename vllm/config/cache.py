@@ -108,7 +108,16 @@ class CacheConfig:
     `streaming_kv_start_size` and `streaming_kv_recent_size`, and must be >=
     `start_size + 2*recent_size` (the single-rotation invariant: consecutive
     rebase events stay at least one full recent window apart, so any cached K
-    entry is rotated at most once before eviction claims it)."""
+    entry is rotated at most once before eviction claims it).
+
+    It must also sit BELOW the model's trained position range (the rotary
+    table's `max_position_embeddings`) with headroom: the event fires once the
+    recent window's front is within `recent_size` of this threshold, and the
+    scheduler step that trips it can still append a whole chunk before the
+    rotation lands, so peak effective positions overshoot the threshold by up
+    to one chunk's position span (bounded by `max_num_batched_tokens`).
+    Startup warns when `rebase_at + max_num_batched_tokens` exceeds the
+    trained range."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"

@@ -45,10 +45,17 @@ R1..R5 — the --streaming-kv-rebase-at config wall. Every check has both legs
       R5 VllmConfig.validate_streaming_kv fences on the other two M-RoPE
          position stores/writers the rebase seats do not reach: the V2 model
          runner (its own RopeState) and multimodal pruning (rewrites both
-         fields after the seats).
+         fields after the seats);
+      R6 VllmConfig.validate_streaming_kv rejects scaled-rope (YaRN) M-RoPE
+         checkpoints, whose rotary would give the rotation silently wrong
+         delta frequencies (rotate_kv_pages' assert strips under -O);
+      R7 VllmConfig.validate_streaming_kv WARNS when rebase_at leaves less
+         than one scheduler step of headroom below the model's trained
+         position range.
 """
 
 import argparse
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -541,24 +548,46 @@ def test_rebase_at_threshold_error_shows_arithmetic():
 # R2 — KV-dtype gate for rebase mode (VllmConfig.validate_streaming_kv seat)
 # ----------------------------------------------------------------------------
 def _fake_model_config(
-    dtype=torch.bfloat16, quantization_config=None, multimodal_config=None
+    dtype=torch.bfloat16,
+    quantization_config=None,
+    multimodal_config=None,
+    text_quantization_config=None,
+    compression_config=None,
+    rope_parameters=None,
+    max_position_embeddings=None,
 ):
     """Just the attributes the rebase gates read; a real ModelConfig needs hub
-    access. Mirrors resolve_kv_cache_dtype_string's hf_config traversal."""
+    access. Mirrors resolve_kv_cache_dtype_string's hf_config traversal and
+    ModelConfig's hf_text_config (== hf_config.get_text_config())."""
+    hf_text_config = SimpleNamespace(
+        quantization_config=text_quantization_config,
+        rope_parameters=rope_parameters,
+        max_position_embeddings=max_position_embeddings,
+    )
     return SimpleNamespace(
         dtype=dtype,
-        hf_config=SimpleNamespace(quantization_config=quantization_config),
+        hf_config=SimpleNamespace(
+            quantization_config=quantization_config,
+            compression_config=compression_config,
+        ),
+        hf_text_config=hf_text_config,
         multimodal_config=multimodal_config,
     )
 
 
-def _validate_streaming_kv(cache_config, model_config, use_v2_model_runner=False):
+def _validate_streaming_kv(
+    cache_config,
+    model_config,
+    use_v2_model_runner=False,
+    max_num_batched_tokens=8192,
+):
     fake = SimpleNamespace(
         cache_config=cache_config,
         model_config=model_config,
         speculative_config=None,
         kv_transfer_config=None,
         use_v2_model_runner=use_v2_model_runner,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=max_num_batched_tokens),
     )
     return VllmConfig.validate_streaming_kv(fake)
 
@@ -640,6 +669,184 @@ def test_rebase_auto_dtype_accepts_compressed_tensors_weight_only():
         _fake_model_config(dtype=torch.bfloat16, quantization_config=quant),
     )
     assert cfg.cache_config.streaming_kv_rebase_at == 49152
+
+
+_FP8_KV_QUANT = {
+    "quant_method": "compressed-tensors",
+    "kv_cache_scheme": {"dynamic": False, "num_bits": 8, "type": "float"},
+}
+
+
+@pytest.mark.parametrize(
+    "seat", ["text_quantization_config", "compression_config"], ids=["text", "legacy"]
+)
+def test_rebase_auto_dtype_rejects_kv_scheme_in_the_other_quant_config_seats(seat):
+    """A checkpoint's quantization config sits in one of three places, and
+    model load reads all three (get_quant_config): the top-level key, a vision
+    model's text_config, and compressed-tensors' legacy compression_config.
+    The gate must sniff the same three, or an fp8-KV checkpoint declaring its
+    scheme in either of the latter two slips past config time and flips
+    cache_dtype at model load, after every validator has run."""
+    with pytest.raises(ValueError, match="kv_cache_scheme"):
+        _validate_streaming_kv(
+            CacheConfig(**_REBASE_OK),
+            _fake_model_config(**{seat: _FP8_KV_QUANT}),
+        )
+
+
+@pytest.mark.parametrize(
+    "seat", ["text_quantization_config", "compression_config"], ids=["text", "legacy"]
+)
+def test_rebase_auto_dtype_accepts_weight_only_in_the_other_quant_config_seats(seat):
+    """Negative leg: the same two seats carrying a weight-only config (no KV
+    scheme) leave the KV cache at model dtype, so rebase stays allowed."""
+    quant = {"quant_method": "compressed-tensors", "kv_cache_scheme": None}
+    cfg = _validate_streaming_kv(
+        CacheConfig(**_REBASE_OK), _fake_model_config(**{seat: quant})
+    )
+    assert cfg.cache_config.streaming_kv_rebase_at == 49152
+
+
+# ----------------------------------------------------------------------------
+# R6 — scaled-rope (YaRN M-RoPE) fence
+# ----------------------------------------------------------------------------
+_YARN_MROPE = {
+    "rope_type": "yarn",
+    "factor": 4.0,
+    "rope_theta": 1_000_000.0,
+    "original_max_position_embeddings": 32768,
+    "mrope_section": [24, 20, 20],
+}
+
+
+@pytest.mark.parametrize(
+    "rope_parameters",
+    [_YARN_MROPE, {"full_attention": _YARN_MROPE}],
+    ids=["flat", "nested_by_layer_type"],
+)
+def test_rebase_rejects_yarn_scaled_mrope(rope_parameters):
+    """get_rope builds MRotaryEmbedding(scaling_factor=factor) for exactly this
+    checkpoint shape, and such a rotary reinterprets _compute_inv_freq's
+    argument as the YaRN scaling factor — so rotate_kv_pages' uniform-Δ
+    frequencies would be silently wrong. Its assert is the last line of
+    defence and strips under -O; the config fence is the real one."""
+    with pytest.raises(ValueError, match="YaRN-scaled"):
+        _validate_streaming_kv(
+            CacheConfig(**_REBASE_OK),
+            _fake_model_config(rope_parameters=rope_parameters),
+        )
+
+
+@pytest.mark.parametrize(
+    "rope_parameters",
+    [
+        None,
+        {},
+        # The shipped demo checkpoint: unscaled M-RoPE (scaling_factor stays None).
+        {
+            "rope_type": "default",
+            "rope_theta": 1_000_000.0,
+            "mrope_section": [24, 20, 20],
+        },
+        # Plain YaRN text rope: no mrope_section, so get_rope builds a
+        # YaRNScalingRotaryEmbedding — not an M-RoPE the rebase ever receives.
+        {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768},
+    ],
+    ids=["none", "empty", "unscaled_mrope", "yarn_without_mrope_section"],
+)
+def test_rebase_accepts_unscaled_rope(rope_parameters):
+    cfg = _validate_streaming_kv(
+        CacheConfig(**_REBASE_OK), _fake_model_config(rope_parameters=rope_parameters)
+    )
+    assert cfg.cache_config.streaming_kv_rebase_at == 49152
+
+
+def test_yarn_scaled_mrope_allowed_without_rebase():
+    """The fence is rebase-only: plain streaming-kv never rotates cached K, so
+    scaled rope is as supported as it was before this flag existed."""
+    cfg = _validate_streaming_kv(
+        CacheConfig(**_STREAMING_KV), _fake_model_config(rope_parameters=_YARN_MROPE)
+    )
+    assert cfg.cache_config.streaming_kv_rebase_at is None
+
+
+# ----------------------------------------------------------------------------
+# R7 — rebase_at upper bound vs the model's trained position range (warning)
+# ----------------------------------------------------------------------------
+def _warnings_from_validate(**kwargs) -> list[str]:
+    """Capture on the module logger directly: vLLM's "vllm" logger does not
+    propagate to root, so caplog would see nothing (same idiom as
+    test_sink_window_manager's log-contract test)."""
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    log = logging.getLogger("vllm.config.vllm")
+    handler = _Capture(level=logging.WARNING)
+    old_level = log.level
+    log.addHandler(handler)
+    log.setLevel(logging.WARNING)
+    try:
+        _validate_streaming_kv(**kwargs)
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(old_level)
+    return [
+        r.getMessage() for r in records if "--streaming-kv-rebase-at" in r.getMessage()
+    ]
+
+
+def test_rebase_at_shipped_geometry_does_not_warn():
+    """The shipped demo geometry: rebase_at 49152 + one 16384-token step lands
+    exactly on the 65536 trained range, so it clears the bound."""
+    assert (
+        _warnings_from_validate(
+            cache_config=CacheConfig(**_REBASE_OK),
+            model_config=_fake_model_config(max_position_embeddings=65536),
+            max_num_batched_tokens=16384,
+        )
+        == []
+    )
+
+
+def test_rebase_at_without_a_step_of_headroom_warns():
+    """One scheduler step can append a whole chunk after the trigger fires, so
+    positions can overshoot the trained range before the rotation lands."""
+    msgs = _warnings_from_validate(
+        cache_config=CacheConfig(**_REBASE_OK),
+        model_config=_fake_model_config(max_position_embeddings=65536),
+        max_num_batched_tokens=32768,
+    )
+    assert len(msgs) == 1
+    # Names the offending numbers and the remedy ceiling (65536 - 32768).
+    assert "49152" in msgs[0] and "65536" in msgs[0] and "32768" in msgs[0]
+
+
+def test_rebase_at_upper_bound_warning_is_rebase_only():
+    """No rebase_at -> nothing to bound, whatever the model's range is."""
+    assert (
+        _warnings_from_validate(
+            cache_config=CacheConfig(**_STREAMING_KV),
+            model_config=_fake_model_config(max_position_embeddings=4096),
+            max_num_batched_tokens=32768,
+        )
+        == []
+    )
+
+
+def test_rebase_at_upper_bound_skipped_without_max_position_embeddings():
+    """Configs that do not declare a trained range (unit-test stubs, exotic
+    checkpoints) must not warn on a guess."""
+    assert (
+        _warnings_from_validate(
+            cache_config=CacheConfig(**_REBASE_OK),
+            model_config=_fake_model_config(),
+            max_num_batched_tokens=32768,
+        )
+        == []
+    )
 
 
 def test_rebase_auto_dtype_without_model_config_skips():

@@ -8,6 +8,9 @@ U5 - remove_skipped_blocks is a no-op while the eviction frontier is
      still inside or at the pinned sink prefix.
 U4 - remove_skipped_blocks pins the first start_block_count blocks
      even when num_computed_tokens grows past start+sliding_window.
+U11 - cross-module property: the manager's eviction frontier never passes the
+     first block the compacted row (`sinkwindow_row_geometry`, shared by the FA
+     metadata builder and the rebase event) still addresses.
 """
 
 import logging
@@ -15,6 +18,8 @@ import logging
 import pytest
 import torch
 
+from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.streaming_rebase import sinkwindow_row_geometry
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -236,6 +241,74 @@ def test_sink_window_eviction_log_line():
         "[streaming-kv] eviction req=req computed=9 total_blocks=11 "
         "alive=10 (start_pinned=2) freed=1"
     ]
+
+
+# ----------------------------------------------------------------------------
+# U11 — eviction frontier vs the compacted row's tail
+# ----------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("block_size", "start_size", "recent_size", "n_max"),
+    [
+        (4, 8, 16, 120),  # start_size block-aligned
+        (4, 6, 16, 120),  # start_size mid-block: cdiv pins a 2nd sink block
+        (8, 16, 32, 200),  # bigger blocks, longer sweep
+        (16, 128, 1024, 3000),  # production shape (block_size 16)
+    ],
+)
+def test_eviction_frontier_never_reaches_the_compacted_row_tail(
+    block_size, start_size, recent_size, n_max
+):
+    """Cross-commit contract, untested until now: the manager decides what to
+    free, `sinkwindow_row_geometry` decides what the FA metadata builder and
+    the rebase event read — two modules, no shared code, and a freed block that
+    the compacted row still addresses is silent attention over reused KV.
+
+    The relation that keeps them consistent is `last_useful_block <=
+    tail_start` at every `num_computed`: the manager's frontier
+    (`(N - recent_size + 1) // block_size`) never passes the geometry's first
+    alive tail block. Swept step by step over a growing row, with the real
+    manager doing the freeing.
+    """
+    spec = make_spec(
+        block_size=block_size, sliding_window=recent_size, start_size=start_size
+    )
+    bp = make_block_pool(2 * cdiv(n_max, block_size) + 16, block_size)
+    manager = make_manager(spec, bp)
+    blocks: list[KVCacheBlock] = []
+    manager.req_to_blocks["req"] = blocks
+
+    for num_computed in range(1, n_max + 1):
+        while len(blocks) < cdiv(num_computed, block_size):
+            blocks.extend(bp.get_new_blocks(1))
+
+        sink_blocks, tail_start, num_valid_blocks, _ = sinkwindow_row_geometry(
+            num_computed, block_size, start_size, recent_size
+        )
+        # The manager's own frontier, capped the way it caps it.
+        last_useful_block = min(
+            (num_computed - recent_size + 1) // block_size, len(blocks)
+        )
+        assert last_useful_block <= tail_start, (
+            f"eviction frontier {last_useful_block} passed the compacted row's "
+            f"first alive tail block {tail_start} at num_computed={num_computed}"
+        )
+
+        manager.remove_skipped_blocks("req", num_computed)
+
+        # ...and the observable consequence: every block the compacted row
+        # addresses (pinned sinks ++ alive tail) is still real.
+        addressed = list(range(min(sink_blocks, num_valid_blocks))) + list(
+            range(tail_start, num_valid_blocks)
+        )
+        for i in addressed:
+            assert blocks[i] != bp.null_block, (
+                f"block {i} is addressed by the compacted row but was freed at "
+                f"num_computed={num_computed} (sink_blocks={sink_blocks}, "
+                f"tail_start={tail_start})"
+            )
+
+    # Not vacuous: the sweep did reach the eviction regime.
+    assert any(b == bp.null_block for b in blocks)
 
 
 # ----------------------------------------------------------------------------

@@ -2409,6 +2409,76 @@ class VllmConfig:
                     "drop --streaming-kv-rebase-at)."
                 )
 
+            # Scaled-rope M-RoPE checkpoints. get_rope builds
+            # MRotaryEmbedding with a non-None scaling_factor for exactly one
+            # config shape (rotary_embedding/__init__.py: rope_type "yarn"
+            # carrying an mrope_section), and such a module reinterprets
+            # _compute_inv_freq's argument as the YaRN scaling factor — so the
+            # uniform-Δ rotation would run at silently wrong frequencies.
+            # rotate_kv_pages asserts on it, but asserts strip under -O, so
+            # the incompatibility is fenced at config time as well.
+            hf_text_cfg = getattr(self.model_config, "hf_text_config", None)
+            rope_parameters = getattr(hf_text_cfg, "rope_parameters", None)
+            if rope_parameters:
+                from vllm.transformers_utils.config import is_rope_parameters_nested
+
+                # Transformers v5 nests rope_parameters by layer type; the
+                # flat form is normalised the same way as in ModelConfig.
+                per_layer = (
+                    rope_parameters
+                    if is_rope_parameters_nested(rope_parameters)
+                    else {"": rope_parameters}
+                )
+                for rp in per_layer.values():
+                    if rp.get("rope_type") != "yarn" or "mrope_section" not in rp:
+                        continue
+                    raise ValueError(
+                        "--streaming-kv-rebase-at is not supported for models "
+                        "whose M-RoPE is YaRN-scaled: this checkpoint declares "
+                        "rope_type 'yarn' with an mrope_section (factor "
+                        f"{rp.get('factor')}), so vLLM builds MRotaryEmbedding "
+                        "with a scaling_factor. The rebase rotation derives its "
+                        "delta frequencies from "
+                        "MRotaryEmbedding._compute_inv_freq(base), which a "
+                        "scaled rotary reinterprets as the YaRN scaling factor "
+                        "— the rotated K would be wrong at every position. Drop "
+                        "--streaming-kv-rebase-at (plain streaming-kv never "
+                        "rotates cached K)."
+                    )
+
+            # Upper bound on rebase_at. The trigger fires when the recent
+            # window's FRONT is within recent_size of rebase_at, so effective
+            # positions peak just past rebase_at — plus whatever one more
+            # scheduler step appends before the rotation lands (bounded by
+            # max_num_batched_tokens). Past the rotary table's trained range
+            # the frequencies are extrapolated, so warn (not reject: the table
+            # is built long enough, and short overshoots are survivable).
+            max_position_embeddings = getattr(
+                hf_text_cfg, "max_position_embeddings", None
+            )
+            step_tokens = getattr(self.scheduler_config, "max_num_batched_tokens", None)
+            rebase_at = self.cache_config.streaming_kv_rebase_at
+            if (
+                max_position_embeddings is not None
+                and step_tokens is not None
+                and rebase_at + step_tokens > max_position_embeddings
+            ):
+                logger.warning(
+                    "--streaming-kv-rebase-at %d leaves less than one "
+                    "scheduler step of headroom below this model's trained "
+                    "position range (max_position_embeddings %d, "
+                    "max_num_batched_tokens %d): a rebase event fires at "
+                    "rebase_at - streaming_kv_recent_size but the step that "
+                    "trips it can still append a whole chunk, so effective "
+                    "positions can overshoot the trained range before the "
+                    "rotation lands. Lower --streaming-kv-rebase-at to at "
+                    "most %d.",
+                    rebase_at,
+                    max_position_embeddings,
+                    step_tokens,
+                    max_position_embeddings - step_tokens,
+                )
+
             rebase_dtype_msg = (
                 "--streaming-kv-rebase-at requires a bf16 or fp16 KV cache: "
                 "the rebase rotation stages in fp32 and writes back in the "
@@ -2424,7 +2494,15 @@ class VllmConfig:
                 )
             if cache_dtype == "auto" and self.model_config is not None:
                 hf_cfg = getattr(self.model_config, "hf_config", None)
+                # Same three seats a checkpoint's quantization config can sit
+                # in as get_quant_config reads at model load: the top-level
+                # key, a vision model's text_config, and compressed-tensors'
+                # legacy "compression_config".
                 quant_cfg = getattr(hf_cfg, "quantization_config", None)
+                if quant_cfg is None:
+                    quant_cfg = getattr(hf_text_cfg, "quantization_config", None)
+                if quant_cfg is None:
+                    quant_cfg = getattr(hf_cfg, "compression_config", None)
                 sniffed = (
                     get_kv_cache_quant_algo_string(quant_cfg)
                     if quant_cfg is not None

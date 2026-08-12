@@ -13,9 +13,12 @@ Test groups:
       ``rotate_kv_pages`` over a real packed paged cache;
   (c) rotate-then-rotate composition == single rotation of the summed Δ
       (unitarity, fp32);
-  (d) sinks untouched — ``token_start`` honors S, ``rebase_delta`` arithmetic;
-  (e) bf16 write-back single-rotation error bound (≤ 2x the measured bf16
-      storage floor, the numerical content of the single-rotation invariant).
+  (d) sinks untouched — ``token_start`` honors S, ``rebase_delta`` arithmetic
+      — plus the two fail-loud rejections (scaled-rope rotary, quantized KV);
+  (e) bf16 write-back single-rotation error bound, measured against the bf16
+      storage floor the cache already carries: RMS ≤ 2x it (unitarity bounds
+      L2) and max ≤ 3x it (the max metric is not constrained by unitarity).
+      This is the numerical content of the single-rotation invariant.
 
 Prior-art sign convention: the old kernels rotated positions BY +δ (callers
 passed δ = −50). ``rotate_kv_pages(delta)`` rotates by −Δ (positions shift
